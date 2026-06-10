@@ -661,6 +661,7 @@ class VwWeconnect extends utils.Adapter {
     }
 
     await this.clearSeatCupraTokens();
+    this.log.info("SEAT/CUPRA classic IDK login started");
     const tokens = await auth.authenticate();
     await this.storeSeatCupraTokens(tokens, "classic_idk");
     this.scheduleSeatCupraTokenRefresh();
