@@ -17,6 +17,10 @@ const {
   completeSeatCupraMissingDeviceRecovery,
   failSeatCupraMissingDeviceRecovery,
   formatSeatCupraOlaFailure,
+  isSeatCupraOptionalEndpoint,
+  getSeatCupraSkippedEndpointKey,
+  createSeatCupraSkippedEndpointDetail,
+  handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraOlaHeaders,
 } = require("../lib/seatCupra");
 
@@ -251,10 +255,10 @@ describe("SEAT/CUPRA fresh device recovery", () => {
   });
 
   it("prevents a second missing-device-token recovery in the same chain", () => {
-    const context = { recoveryAttempted: false, skipRemaining: false };
+    const context = { recoveryAttempted: false, stopDetailPolling: false };
     expect(beginSeatCupraMissingDeviceRecovery(false, context)).to.equal(true);
     expect(beginSeatCupraMissingDeviceRecovery(true, context)).to.equal(false);
-    expect(context.skipRemaining).to.equal(true);
+    expect(context.stopDetailPolling).to.equal(false);
   });
 
   it("resets recovery flags after a successful retry", () => {
@@ -312,6 +316,85 @@ describe("SEAT/CUPRA fresh device recovery", () => {
     expect(message).not.to.include("access_token=secret");
     expect(message).not.to.include("bearer-secret");
     expect(message).not.to.include(jwt);
+  });
+});
+
+
+describe("SEAT/CUPRA optional OLA endpoints", () => {
+  const missingDevice = { code: "missing-device-token", message: "Forbidden device detected" };
+
+  it("classifies warninglights, maintenance, and parkingposition as optional", () => {
+    expect(isSeatCupraOptionalEndpoint("/v3/vehicles/VIN/warninglights")).to.equal(true);
+    expect(isSeatCupraOptionalEndpoint("/v1/vehicles/VIN/maintenance")).to.equal(true);
+    expect(isSeatCupraOptionalEndpoint("/v1/vehicles/VIN/parkingposition")).to.equal(true);
+    expect(isSeatCupraOptionalEndpoint("/v2/vehicles/VIN/status")).to.equal(false);
+    expect(isSeatCupraOptionalEndpoint("/v1/vehicles/VIN/ranges")).to.equal(false);
+  });
+
+  it("skips a repeated optional failure without stopping the polling cycle", async () => {
+    const context = { recoveryAttempted: true, stopDetailPolling: false };
+    const skipped = new Set();
+    const details = [];
+    const warnings = [];
+    const restarts = 0;
+    const terminates = 0;
+    const result = await handleSeatCupraRepeatedMissingDeviceToken({
+      method: "get",
+      pathname: "/v3/vehicles/VIN/warninglights",
+      status: 403,
+      data: missingDevice,
+      recoveryContext: context,
+      recordSkipped: async (method, pathname, status, data) => {
+        skipped.add(getSeatCupraSkippedEndpointKey(method, pathname));
+        details.push(createSeatCupraSkippedEndpointDetail(method, pathname, status, data, new Date(0)));
+      },
+      logWarning: (message) => warnings.push(message),
+      logError: () => {},
+      completeRecovery: () => {},
+    });
+    expect(result).to.deep.equal({ skipped: true, stopCycle: false });
+    expect(context.stopDetailPolling).to.equal(false);
+    expect(skipped.has("GET /v3/vehicles/VIN/warninglights")).to.equal(true);
+    expect(details[0]).to.deep.equal({
+      method: "GET",
+      pathname: "/v3/vehicles/VIN/warninglights",
+      status: 403,
+      code: "missing-device-token",
+      timestamp: "1970-01-01T00:00:00.000Z",
+    });
+    expect(warnings[0]).to.include("optional OLA endpoint skipped after fresh login");
+    expect(restarts).to.equal(0);
+    expect(terminates).to.equal(0);
+  });
+
+  it("stops only the detail cycle for a repeated core endpoint failure", async () => {
+    const context = { recoveryAttempted: true, stopDetailPolling: false };
+    const errors = [];
+    const result = await handleSeatCupraRepeatedMissingDeviceToken({
+      method: "get",
+      pathname: "/v2/vehicles/VIN/status",
+      status: 403,
+      data: missingDevice,
+      recoveryContext: context,
+      recordSkipped: async () => { throw new Error("core endpoint must not be skipped"); },
+      logWarning: () => {},
+      logError: (message) => errors.push(message),
+      completeRecovery: () => {},
+    });
+    expect(result.stopCycle).to.equal(true);
+    expect(result.skipped).to.equal(false);
+    expect(context.stopDetailPolling).to.equal(true);
+    expect(errors[0]).to.include("core OLA endpoint rejected token after fresh login");
+  });
+
+  it("allows polling to continue after an optional endpoint returns null", () => {
+    const responses = [null, { range: 250 }];
+    const processed = [];
+    for (const response of responses) {
+      if (response == null) continue;
+      processed.push(response);
+    }
+    expect(processed).to.deep.equal([{ range: 250 }]);
   });
 });
 

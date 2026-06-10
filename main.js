@@ -30,6 +30,9 @@ const {
   completeSeatCupraMissingDeviceRecovery,
   failSeatCupraMissingDeviceRecovery,
   formatSeatCupraOlaFailure,
+  getSeatCupraSkippedEndpointKey,
+  createSeatCupraSkippedEndpointDetail,
+  handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraBrandConfig,
   getSeatCupraOlaHeaders,
   isMissingDeviceToken,
@@ -75,6 +78,8 @@ class VwWeconnect extends utils.Adapter {
     this.seatCupraMissingDeviceWarningLogged = false;
     this.seatCupraPollingStopped = false;
     this.seatCupraMissingDeviceRecoveryInProgress = null;
+    this.seatCupraSkippedEndpoints = new Set();
+    this.seatCupraSkippedEndpointDetails = [];
 
     this.homeRegion = {};
     this.homeRegionSetter = {};
@@ -443,9 +448,14 @@ class VwWeconnect extends utils.Adapter {
               if (this.config.type !== "go") {
                 const seatCupraRecoveryContext = {
                   recoveryAttempted: false,
-                  skipRemaining: false,
+                  stopDetailPolling: false,
                   failureLogged: false,
                 };
+                if (this.config.type === "seatcupra" || this.config.type === "seat") {
+                  this.resetSeatCupraSkippedEndpoints().catch((error) => {
+                    this.log.debug("SEAT/CUPRA skipped endpoint state reset failed: " + error.message);
+                  });
+                }
                 this.vinArray.forEach((vin) => {
                   if (this.config.type === "id" || this.config.type === "audietron") {
                     this.getHomeRegion(vin);
@@ -1914,7 +1924,10 @@ class VwWeconnect extends utils.Adapter {
       });
       return;
     } else if (this.config.type === "seatcupra" || this.config.type === "seat") {
-      const recoveryContext = { recoveryAttempted: false, skipRemaining: false, failureLogged: false };
+      const recoveryContext = { recoveryAttempted: false, stopDetailPolling: false, failureLogged: false };
+      this.resetSeatCupraSkippedEndpoints().catch((error) => {
+        this.log.debug("SEAT/CUPRA skipped endpoint state reset failed: " + error.message);
+      });
       this.vinArray.forEach((vin) => {
         this.getSeatCupraStatus(vin, recoveryContext);
       });
@@ -2849,6 +2862,46 @@ class VwWeconnect extends utils.Adapter {
     return this.seatCupraMissingDeviceRecoveryInProgress;
   }
 
+  async updateSeatCupraSkippedEndpointsState() {
+    await this.extendObjectAsync("info.seatCupraSkippedEndpoints", {
+      type: "state",
+      common: {
+        name: "SEAT/CUPRA OLA endpoints skipped in the current polling cycle",
+        type: "json",
+        role: "json",
+        read: true,
+        write: false,
+      },
+      native: {},
+    });
+    await this.setStateAsync(
+      "info.seatCupraSkippedEndpoints",
+      JSON.stringify(this.seatCupraSkippedEndpointDetails),
+      true,
+    );
+  }
+
+  resetSeatCupraSkippedEndpoints() {
+    this.seatCupraSkippedEndpoints.clear();
+    this.seatCupraSkippedEndpointDetails = [];
+    return this.updateSeatCupraSkippedEndpointsState();
+  }
+
+  async recordSeatCupraSkippedEndpoint(method, endpoint, status, data) {
+    const key = getSeatCupraSkippedEndpointKey(method, endpoint);
+    if (!this.seatCupraSkippedEndpoints.has(key)) {
+      const detail = createSeatCupraSkippedEndpointDetail(method, endpoint, status, data);
+      detail.code = redactSecrets(detail.code).slice(0, 100);
+      this.seatCupraSkippedEndpoints.add(key);
+      this.seatCupraSkippedEndpointDetails.push(detail);
+      try {
+        await this.updateSeatCupraSkippedEndpointsState();
+      } catch (error) {
+        this.log.debug("SEAT/CUPRA skipped endpoint state update failed: " + error.message);
+      }
+    }
+  }
+
   logSeatCupraOlaFailure(method, endpoint, status, data) {
     this.log.error(formatSeatCupraOlaFailure({
       method,
@@ -2875,6 +2928,8 @@ class VwWeconnect extends utils.Adapter {
     if (this.seatCupraPollingStopped) throw new Error("SEAT/CUPRA polling is stopped for this adapter run");
     let response;
     const endpoint = new URL(url).pathname;
+    const endpointKey = getSeatCupraSkippedEndpointKey(method, endpoint);
+    if (this.seatCupraSkippedEndpoints.has(endpointKey)) return null;
     for (const variant of ["primary", "fallback"]) {
       try {
         response = await axios({
@@ -2897,22 +2952,25 @@ class VwWeconnect extends utils.Adapter {
     }
 
     if (response && response.status === 403 && isMissingDeviceToken(response.data)) {
-      if (!suppressErrorLog && !recoveryContext.failureLogged) {
-        this.logSeatCupraOlaFailure(method, endpoint, response.status, response.data);
-        recoveryContext.failureLogged = true;
-      }
       if (disableMissingDeviceRecovery) {
         const error = new Error(`SEAT/CUPRA OLA missing-device-token: ${String(method).toUpperCase()} ${endpoint}`);
         error.response = response;
         throw error;
       }
       if (!beginSeatCupraMissingDeviceRecovery(authRetried, recoveryContext)) {
-        failSeatCupraMissingDeviceRecovery(this);
-        const message =
-          `SEAT/CUPRA OLA still reports missing-device-token after fresh Device Authorization login: ` +
-          `${String(method).toUpperCase()} ${endpoint}`;
-        this.log.error(message);
-        throw new Error(message);
+        const repeatedFailure = await handleSeatCupraRepeatedMissingDeviceToken({
+          method,
+          pathname: endpoint,
+          status: response.status,
+          data: response.data,
+          recoveryContext,
+          recordSkipped: (...args) => this.recordSeatCupraSkippedEndpoint(...args),
+          logWarning: (message) => this.log.warn(redactSecrets(message)),
+          logError: (message) => this.log.error(redactSecrets(message)),
+          completeRecovery: () => completeSeatCupraMissingDeviceRecovery(this),
+        });
+        if (repeatedFailure.skipped) return null;
+        throw new Error(repeatedFailure.message);
       }
       try {
         const result = await retrySeatCupraRequestAfterRecovery({
@@ -2930,8 +2988,7 @@ class VwWeconnect extends utils.Adapter {
         completeSeatCupraMissingDeviceRecovery(this);
         return result;
       } catch (error) {
-        recoveryContext.skipRemaining = true;
-        failSeatCupraMissingDeviceRecovery(this);
+        if (this.seatCupraPollingStopped) recoveryContext.stopDetailPolling = true;
         throw error;
       }
     }
@@ -4754,7 +4811,7 @@ class VwWeconnect extends utils.Adapter {
   }
   async getSeatCupraStatus(
     vin,
-    recoveryContext = { recoveryAttempted: false, skipRemaining: false, failureLogged: false },
+    recoveryContext = { recoveryAttempted: false, stopDetailPolling: false, failureLogged: false },
   ) {
     const endpoints = [
       {
@@ -4822,14 +4879,19 @@ class VwWeconnect extends utils.Adapter {
       this.log.debug("Skip trip check because of last check was less than 60min ago");
     }
     for (const endpoint of endpoints) {
-      if (this.seatCupraPollingStopped || recoveryContext.skipRemaining) return;
+      if (this.seatCupraPollingStopped || recoveryContext.stopDetailPolling) return;
       if (this.ignoredPaths[vin] && this.ignoredPaths[vin].includes(endpoint.path)) {
         this.log.debug("Ignored path: " + endpoint.path);
         continue;
       }
 
+      const endpointPathname = new URL(endpoint.url).pathname;
+      const endpointKey = getSeatCupraSkippedEndpointKey("get", endpointPathname);
+      if (this.seatCupraSkippedEndpoints.has(endpointKey)) continue;
+      this.log.debug("SEAT/CUPRA OLA request: GET " + endpointPathname);
       await this.seatCupraOlaRequest("get", endpoint.url, { vin, recoveryContext })
         .then(async (responseData) => {
+          if (responseData == null) return;
           this.log.debug("Received data for " + endpoint.path);
           this.log.debug(JSON.stringify(responseData));
           if (endpoint.path === "mileage") {
@@ -4868,7 +4930,7 @@ class VwWeconnect extends utils.Adapter {
           }
         })
         .catch((error) => {
-          if (this.seatCupraPollingStopped || recoveryContext.skipRemaining) return;
+          if (this.seatCupraPollingStopped || recoveryContext.stopDetailPolling) return;
           if (error.response && (error.response.status === 400 || error.response.status === 404)) {
             this.log.info("Vehicle is not supporting: " + endpoint.path);
             if (!this.ignoredPaths[vin]) {
