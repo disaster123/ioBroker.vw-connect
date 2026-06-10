@@ -70,13 +70,14 @@ describe("adapter startup data source selection", () => {
 
     await adapter.onReady();
 
-    expect(adapter.runEuDataAct).to.have.been.calledOnceWithExactly("CUPRA");
-    expect(adapter.login).not.to.have.been.called;
-    expect(adapter.getPersonalData).not.to.have.been.called;
-    expect(adapter.getVehicles).not.to.have.been.called;
-    expect(adapter.getSeatCupraStatus).not.to.have.been.called;
-    expect(adapter.subscribeStates).to.have.been.calledOnceWithExactly("*");
-    expect(adapter.log.info).to.have.been.calledWithExactly(
+    sinon.assert.calledOnceWithExactly(adapter.runEuDataAct, "CUPRA");
+    sinon.assert.notCalled(adapter.login);
+    sinon.assert.notCalled(adapter.getPersonalData);
+    sinon.assert.notCalled(adapter.getVehicles);
+    sinon.assert.notCalled(adapter.getSeatCupraStatus);
+    sinon.assert.calledOnceWithExactly(adapter.subscribeStates, "*");
+    sinon.assert.calledWithExactly(
+      adapter.log.info,
       "My CUPRA: legacy OLA detail API is blocked by missing-device-token. " +
         "Using EU Data Act as the only data source.",
     );
@@ -87,9 +88,9 @@ describe("adapter startup data source selection", () => {
 
     await adapter.onReady();
 
-    expect(adapter.runEuDataAct).to.have.been.calledOnceWithExactly("VOLKSWAGEN_PASSENGER_CARS");
-    expect(adapter.login).not.to.have.been.called;
-    expect(adapter.subscribeStates).to.have.been.calledOnceWithExactly("*");
+    sinon.assert.calledOnceWithExactly(adapter.runEuDataAct, "VOLKSWAGEN_PASSENGER_CARS");
+    sinon.assert.notCalled(adapter.login);
+    sinon.assert.calledOnceWithExactly(adapter.subscribeStates, "*");
   });
 
   for (const [type, brand] of [
@@ -101,9 +102,9 @@ describe("adapter startup data source selection", () => {
 
       await adapter.onReady();
 
-      expect(adapter.runEuDataAct).to.have.been.calledOnceWithExactly(brand);
-      expect(adapter.login).to.have.been.calledOnce;
-      expect(adapter.subscribeStates).to.have.been.calledOnceWithExactly("*");
+      sinon.assert.calledOnceWithExactly(adapter.runEuDataAct, brand);
+      sinon.assert.calledOnce(adapter.login);
+      sinon.assert.calledOnceWithExactly(adapter.subscribeStates, "*");
     });
   }
 
@@ -161,11 +162,11 @@ describe("adapter startup data source selection", () => {
 
     await adapter.getEuDataActStatus(vin);
 
-    expect(adapter.euDataAct.downloadDataset).to.have.been.calledTwice;
-    expect(adapter.euDataAct.downloadDataset.firstCall).to.have.been.calledWithExactly(vin, "request-id", "newest.zip");
-    expect(adapter.euDataAct.downloadDataset.secondCall).to.have.been.calledWithExactly(vin, "request-id", "older.zip");
-    expect(adapter.euDataAct.login).not.to.have.been.called;
-    expect(adapter.restart).not.to.have.been.called;
+    sinon.assert.calledTwice(adapter.euDataAct.downloadDataset);
+    expect(adapter.euDataAct.downloadDataset.firstCall.args).to.deep.equal([vin, "request-id", "newest.zip"]);
+    expect(adapter.euDataAct.downloadDataset.secondCall.args).to.deep.equal([vin, "request-id", "older.zip"]);
+    sinon.assert.notCalled(adapter.euDataAct.login);
+    sinon.assert.notCalled(adapter.restart);
     expect(adapter.euDataActLastDataset[vin]).to.equal("older.zip");
 
     const telemetryCall = adapter.json2iob.parse.getCalls().find((call) => call.args[0] === `${vin}.statuseudata`);
@@ -184,6 +185,13 @@ describe("adapter startup data source selection", () => {
       lastError: "",
     });
     expect(adapter.euDataActDiagnostics[vin].lastSuccess).to.be.a("string").and.not.equal("");
+    expect(adapter.euDataActDownloadCooldowns[vin]["newest.zip"]).to.be.greaterThan(Date.now());
+    sinon.assert.notCalled(adapter.log.warn);
+
+    await adapter.getEuDataActStatus(vin);
+
+    sinon.assert.calledTwice(adapter.euDataAct.downloadDataset);
+    sinon.assert.notCalled(adapter.log.warn);
   });
 
   it("preserves existing EU Data Act states when all bounded download attempts fail", async () => {
@@ -204,18 +212,30 @@ describe("adapter startup data source selection", () => {
     }));
     const adapter = createEuDataActStatusAdapter(vin, datasets, downloads);
     adapter.euDataActLastDataset[vin] = "last-good.zip";
+    adapter.euDataActDiagnostics[vin] = {
+      lastSuccessFile: "last-good.zip",
+      lastSuccess: "2026-06-10T05:00:00.000Z",
+    };
 
     await adapter.getEuDataActStatus(vin);
 
-    expect(adapter.euDataAct.downloadDataset).to.have.callCount(5);
-    expect(adapter.json2iob.parse.neverCalledWith(`${vin}.statuseudata`)).to.equal(true);
-    expect(adapter.json2iob.parse).to.have.been.calledOnce;
+    sinon.assert.callCount(adapter.euDataAct.downloadDataset, 5);
+    sinon.assert.neverCalledWith(adapter.json2iob.parse, `${vin}.statuseudata`);
+    sinon.assert.calledOnce(adapter.json2iob.parse);
     expect(adapter.json2iob.parse.firstCall.args[0]).to.equal(`${vin}.statuseudata.diagnostic`);
     expect(adapter.euDataActLastDataset[vin]).to.equal("last-good.zip");
     expect(adapter.euDataActDiagnostics[vin].lastError).to.equal("transient download error");
-    expect(adapter.euDataActDiagnostics[vin].lastSuccessFile).to.equal(undefined);
-    expect(adapter.euDataAct.login).not.to.have.been.called;
-    expect(adapter.restart).not.to.have.been.called;
+    expect(adapter.euDataActDiagnostics[vin].lastSuccessFile).to.equal("last-good.zip");
+    expect(adapter.euDataActDiagnostics[vin].lastSuccess).to.equal("2026-06-10T05:00:00.000Z");
+    sinon.assert.notCalled(adapter.euDataAct.login);
+    sinon.assert.notCalled(adapter.restart);
+    sinon.assert.calledOnce(adapter.log.warn);
+    const warning = adapter.log.warn.firstCall.args[0];
+    expect(warning).to.include("attempted=5");
+    expect(warning).to.include("status=500");
+    expect(warning).to.include("content-type=text/html; charset=utf-8");
+    expect(warning).to.include("bytes=904");
+    expect(warning).to.not.include(vin);
   });
 
 });
@@ -250,12 +270,14 @@ describe("EU Data Act dataset download responses", () => {
       log,
     });
     client._loggedIn = true;
-    sinon.spy(client, "login");
-    return { client, log };
+    const login = sinon.stub(client, "login").callsFake(async () => {
+      client._loggedIn = true;
+    });
+    return { client, log, login };
   }
 
   it("treats HTTP 500 HTML as a transient per-file error without re-login or sensitive logging", async () => {
-    const { client, log } = createClient();
+    const { client, log, login } = createClient();
     const html = Buffer.from("<html><body>Adobe AEM Cloud internal error</body></html>");
     sinon.stub(client, "_getBuffer").resolves({
       status: 500,
@@ -277,8 +299,9 @@ describe("EU Data Act dataset download responses", () => {
       byteSize: html.length,
       zipMagic: false,
     });
-    expect(client.login).not.to.have.been.called;
-    expect(log.warn).to.have.been.calledOnce;
+    sinon.assert.notCalled(login);
+    sinon.assert.calledOnce(log.debug);
+    sinon.assert.notCalled(log.warn);
     const logged = [...log.debug.args, ...log.info.args, ...log.warn.args, ...log.error.args].flat().join(" ");
     expect(logged).to.include("filename=newest.zip");
     expect(logged).to.include("status=500");
@@ -290,8 +313,56 @@ describe("EU Data Act dataset download responses", () => {
     expect(logged).to.not.include("secret-password");
   });
 
+  for (const status of [401, 403]) {
+    it(`re-authenticates once before retrying an HTTP ${status} HTML response`, async () => {
+      const { client, login } = createClient();
+      const zip = createStoredJsonZip({ Data: [] });
+      const getBuffer = sinon
+        .stub(client, "_getBuffer")
+        .onFirstCall()
+        .resolves({
+          status,
+          url: "https://example.invalid/download",
+          headers: { "content-type": "text/html; charset=utf-8" },
+          body: Buffer.from("<html>login</html>"),
+        })
+        .onSecondCall()
+        .resolves({
+          status: 200,
+          url: "https://example.invalid/download",
+          headers: { "content-type": "application/zip" },
+          body: zip,
+        });
+
+      const result = await client.downloadDataset("WVWZZZTEST1234567", "request-id", "dataset.zip");
+
+      sinon.assert.calledOnce(login);
+      sinon.assert.calledTwice(getBuffer);
+      expect(result.status).to.equal(200);
+      expect(result.zipMagic).to.equal(true);
+    });
+  }
+
+  it("rejects HTTP 200 HTML as a transient non-ZIP response without re-login", async () => {
+    const { client, log, login } = createClient();
+    sinon.stub(client, "_getBuffer").resolves({
+      status: 200,
+      url: "https://example.invalid/download",
+      headers: { "content-type": "text/html; charset=utf-8" },
+      body: Buffer.from("<html>temporary error</html>"),
+    });
+
+    const result = await client.downloadDataset("WVWZZZTEST1234567", "request-id", "dataset.zip");
+
+    expect(result.transientDownloadError).to.equal(true);
+    expect(result.status).to.equal(200);
+    expect(result.zipMagic).to.equal(false);
+    sinon.assert.notCalled(login);
+    sinon.assert.notCalled(log.warn);
+  });
+
   it("accepts a non-empty HTTP 200 ZIP with PK magic", async () => {
-    const { client } = createClient();
+    const { client, login } = createClient();
     const zip = createStoredJsonZip({ Data: [] });
     sinon.stub(client, "_getBuffer").resolves({
       status: 200,
@@ -307,6 +378,6 @@ describe("EU Data Act dataset download responses", () => {
     expect(result.byteSize).to.equal(zip.length);
     expect(result.fileName).to.equal("dataset.json");
     expect(result.json).to.deep.equal({ Data: [] });
-    expect(client.login).not.to.have.been.called;
+    sinon.assert.notCalled(login);
   });
 });

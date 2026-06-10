@@ -7026,6 +7026,7 @@ class VwWeconnect extends utils.Adapter {
     this.euDataActNoContentLogged = this.euDataActNoContentLogged || {};
     this.euDataActBackoffUntil = this.euDataActBackoffUntil || {};
     this.euDataActDiagnostics = this.euDataActDiagnostics || {};
+    this.euDataActDownloadCooldowns = this.euDataActDownloadCooldowns || {};
     // Load json2iob enrichment maps once. Both files are derived from the
     // EU Data Act PDF data dictionary; descriptions are friendly names per
     // dataFieldName leaf, states are rawValue->label maps for enum fields.
@@ -7250,6 +7251,7 @@ class VwWeconnect extends utils.Adapter {
     this.euDataActLastDataset = this.euDataActLastDataset || {};
     this.euDataActNoContentLogged = this.euDataActNoContentLogged || {};
     this.euDataActDiagnostics = this.euDataActDiagnostics || {};
+    this.euDataActDownloadCooldowns = this.euDataActDownloadCooldowns || {};
     try {
       const identifier = await this._ensureEuDataActIdentifier(vin);
       if (!identifier) return;
@@ -7302,30 +7304,55 @@ class VwWeconnect extends utils.Adapter {
         return;
       }
 
-      const candidates = contentDatasets.slice(0, 5);
       const diagnostics = {
         lastFileListCount: datasets.length,
         lastAttemptedFile: newest.name,
         lastError: "",
       };
+      const cooldowns = (this.euDataActDownloadCooldowns[vin] = this.euDataActDownloadCooldowns[vin] || {});
+      const now = Date.now();
+      const cooldownMs = 10 * 60 * 1000;
+      let attemptedFiles = 0;
       let selected = null;
       let selectedDataset = null;
-      for (let index = 0; index < candidates.length; index++) {
-        const candidate = candidates[index];
+      let lastDownload = null;
+
+      for (const candidate of contentDatasets) {
+        if (attemptedFiles >= 5) break;
+        const cooldownUntil = cooldowns[candidate.name] || 0;
+        if (cooldownUntil > now) {
+          this.log.debug(
+            `EU Data Act: skipping cooling dataset vin=${this._maskVin(vin)} ` +
+              `filename=${candidate.name} until=${new Date(cooldownUntil).toISOString()}`,
+          );
+          continue;
+        }
+        if (cooldownUntil) delete cooldowns[candidate.name];
+
+        // Once the scan reaches the last successful file, everything after it
+        // is older and must not be downloaded again merely as a fallback.
+        if (candidate.name === this.euDataActLastDataset[vin]) break;
+
+        attemptedFiles++;
         const downloadStart = Date.now();
         let dl;
         try {
           dl = await this.euDataAct.downloadDataset(vin, identifier, candidate.name);
         } catch (err) {
-          diagnostics.lastError = (err && err.message) || "dataset download failed";
-          if (index > 0) diagnostics.fallbackFile = candidate.name;
+          const message = (err && err.message) || "dataset download failed";
+          if (/HTTP (?:401|403)/.test(message)) throw err;
+          diagnostics.lastError = message;
+          cooldowns[candidate.name] = now + cooldownMs;
+          lastDownload = { status: 0, contentType: "", byteSize: 0 };
           this.log.debug(
             `EU Data Act: dataset download failed vin=${this._maskVin(vin)} ` +
-              `filename=${candidate.name}: ${diagnostics.lastError}`,
+              `filename=${candidate.name}: ${message}`,
           );
           continue;
         }
-        if (index === 0) {
+        lastDownload = dl;
+        if (attemptedFiles === 1) {
+          diagnostics.lastAttemptedFile = candidate.name;
           diagnostics.lastDownloadStatus = dl.status;
           diagnostics.lastDownloadContentType = dl.contentType || "";
           diagnostics.lastDownloadBytes = dl.byteSize || 0;
@@ -7336,8 +7363,10 @@ class VwWeconnect extends utils.Adapter {
         }
         if (dl.transientDownloadError || dl.status !== 200 || !dl.zipMagic || !dl.byteSize) {
           diagnostics.lastError = "transient download error";
+          cooldowns[candidate.name] = now + cooldownMs;
           continue;
         }
+        delete cooldowns[candidate.name];
         selected = dl;
         selectedDataset = candidate;
         this.log.debug(
@@ -7348,8 +7377,18 @@ class VwWeconnect extends utils.Adapter {
       }
 
       if (!selected || !selectedDataset) {
+        if (attemptedFiles === 0) {
+          this.log.debug(`EU Data Act: ${vin} has no eligible dataset to download this cycle`);
+          return;
+        }
         diagnostics.lastError = diagnostics.lastError || "transient download error";
         await this._writeEuDataActDiagnostics(vin, diagnostics);
+        this.log.warn(
+          `EU Data Act: all dataset downloads failed vin=${this._maskVin(vin)} ` +
+            `attempted=${attemptedFiles} status=${lastDownload ? lastDownload.status : 0} ` +
+            `content-type=${(lastDownload && lastDownload.contentType) || "unknown"} ` +
+            `bytes=${(lastDownload && lastDownload.byteSize) || 0}`,
+        );
         return;
       }
 
