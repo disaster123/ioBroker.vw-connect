@@ -7,6 +7,13 @@ const {
   decodeBase64UrlJson,
   resolveSeatCupraUserId,
   getSeatCupraGarageUrl,
+  clearSeatCupraTokenValues,
+  runSeatCupraFreshRecovery,
+  retrySeatCupraRequestAfterRecovery,
+  startSeatCupraDeviceAuthorization,
+  shouldUseSeatCupraRefreshToken,
+  beginSeatCupraMissingDeviceRecovery,
+  formatSeatCupraOlaFailure,
   getSeatCupraOlaHeaders,
 } = require("../lib/seatCupra");
 
@@ -174,6 +181,96 @@ describe("SEAT/CUPRA user id resolution", () => {
       return url;
     }).to.throw("SEAT/CUPRA user id could not be resolved");
     expect(requestCalled).to.equal(false);
+  });
+});
+
+
+describe("SEAT/CUPRA fresh device recovery", () => {
+  it("bypasses refresh_token when forceFreshDeviceLogin is enabled", () => {
+    expect(shouldUseSeatCupraRefreshToken(false, "stale-refresh")).to.equal(true);
+    expect(shouldUseSeatCupraRefreshToken(true, "stale-refresh")).to.equal(false);
+  });
+
+  it("clears old access, refresh, and ID tokens before fresh authorization", () => {
+    const config = {
+      atoken: "old-access",
+      rtoken: "old-refresh",
+      idtoken: "old-id",
+      seatCupraIdToken: "old-seat-id",
+      seatCupraTokenExpiresAt: 123,
+    };
+    const native = { ...config };
+    clearSeatCupraTokenValues(config);
+    clearSeatCupraTokenValues(native);
+    for (const target of [config, native]) {
+      expect(target.atoken).to.equal("");
+      expect(target.rtoken).to.equal("");
+      expect(target.idtoken).to.equal("");
+      expect(target.seatCupraIdToken).to.equal("");
+      expect(target.seatCupraTokenExpiresAt).to.equal(0);
+    }
+  });
+
+  it("clears stale tokens before requesting fresh device authorization", async () => {
+    const events = [];
+    const device = await startSeatCupraDeviceAuthorization({
+      forceFreshDeviceLogin: true,
+      clearTokens: async () => events.push("clear"),
+      requestDeviceCode: async () => { events.push("request"); return { device_code: "new" }; },
+    });
+    expect(events).to.deep.equal(["clear", "request"]);
+    expect(device.device_code).to.equal("new");
+  });
+
+  it("requests forceFreshDeviceLogin and resolves the user before retry", async () => {
+    const events = [];
+    await runSeatCupraFreshRecovery({
+      login: async (options) => events.push(["login", options]),
+      resolveUserId: async () => events.push(["resolve"]),
+    });
+    expect(events).to.deep.equal([
+      ["login", { forceFreshDeviceLogin: true }],
+      ["resolve"],
+    ]);
+  });
+
+  it("retries the failed request exactly once after recovery", async () => {
+    let recoveries = 0;
+    let retries = 0;
+    const result = await retrySeatCupraRequestAfterRecovery({
+      recover: async () => { recoveries++; },
+      retryRequest: async () => { retries++; return "ok"; },
+    });
+    expect(result).to.equal("ok");
+    expect(recoveries).to.equal(1);
+    expect(retries).to.equal(1);
+  });
+
+  it("prevents a second missing-device-token recovery in the same chain", () => {
+    const context = { recoveryAttempted: false, skipRemaining: false };
+    expect(beginSeatCupraMissingDeviceRecovery(false, context)).to.equal(true);
+    expect(beginSeatCupraMissingDeviceRecovery(true, context)).to.equal(false);
+    expect(context.skipRemaining).to.equal(true);
+  });
+
+  it("formats OLA failures with pathname and status without secrets", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature";
+    const message = formatSeatCupraOlaFailure({
+      method: "get",
+      url: "https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/VIN/status?access_token=secret",
+      status: 403,
+      data: {
+        code: "missing-device-token",
+        message: `Forbidden device detected Bearer bearer-secret id_token=${jwt}`,
+      },
+      redact: redactSecrets,
+    });
+    expect(message).to.include("GET /v2/vehicles/VIN/status status=403");
+    expect(message).to.include("code=missing-device-token");
+    expect(message).to.include("Forbidden device detected");
+    expect(message).not.to.include("access_token=secret");
+    expect(message).not.to.include("bearer-secret");
+    expect(message).not.to.include(jwt);
   });
 });
 

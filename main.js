@@ -21,6 +21,13 @@ const { OAuthDeviceGrant, redactSecrets } = require("./lib/oauthDeviceGrant");
 const {
   resolveSeatCupraUserId: resolveSeatCupraUserIdFromSources,
   getSeatCupraGarageUrl,
+  clearSeatCupraTokenValues,
+  runSeatCupraFreshRecovery,
+  retrySeatCupraRequestAfterRecovery,
+  startSeatCupraDeviceAuthorization,
+  shouldUseSeatCupraRefreshToken,
+  beginSeatCupraMissingDeviceRecovery,
+  formatSeatCupraOlaFailure,
   getSeatCupraBrandConfig,
   getSeatCupraOlaHeaders,
   isMissingDeviceToken,
@@ -62,10 +69,8 @@ class VwWeconnect extends utils.Adapter {
     this.fupdateInterval = null;
     this.refreshTokenTimeout = null;
     this.seatCupraTokenExpiresAt = 0;
-    this.seatCupraForcedReloginAttempted = false;
     this.seatCupraPollingStopped = false;
-    this.seatCupraMissingDeviceWarningLogged = false;
-    this.seatCupraReloginPromise = null;
+    this.seatCupraMissingDeviceRecoveryInProgress = null;
 
     this.homeRegion = {};
     this.homeRegionSetter = {};
@@ -432,6 +437,11 @@ class VwWeconnect extends utils.Adapter {
           this.getVehicles()
             .then(() => {
               if (this.config.type !== "go") {
+                const seatCupraRecoveryContext = {
+                  recoveryAttempted: false,
+                  skipRemaining: false,
+                  failureLogged: false,
+                };
                 this.vinArray.forEach((vin) => {
                   if (this.config.type === "id" || this.config.type === "audietron") {
                     this.getHomeRegion(vin);
@@ -440,7 +450,7 @@ class VwWeconnect extends utils.Adapter {
                       this.log.error("get id status Failed");
                     });
                   } else if (this.config.type === "seatcupra" || this.config.type === "seat") {
-                    this.getSeatCupraStatus(vin);
+                    this.getSeatCupraStatus(vin, seatCupraRecoveryContext);
                   } else if (this.config.type === "audidata") {
                     this.getAudiDataStatus(vin).catch(() => {
                       this.log.error("get audi data status Failed");
@@ -605,6 +615,21 @@ class VwWeconnect extends utils.Adapter {
     }
   }
 
+  async clearSeatCupraTokens() {
+    clearSeatCupraTokenValues(this.config);
+    this.seatCupraTokenExpiresAt = 0;
+    this.seatcupraUser = undefined;
+    try {
+      const obj = await this.getForeignObjectAsync("system.adapter." + this.namespace);
+      if (obj && obj.native) {
+        clearSeatCupraTokenValues(obj.native);
+        await this.setForeignObjectAsync("system.adapter." + this.namespace, obj);
+      }
+    } catch (error) {
+      throw new Error("SEAT/CUPRA stale token persistence could not be cleared", { cause: error });
+    }
+  }
+
   async setSeatCupraDeviceApprovalStates(device) {
     const expiry = new Date(Date.now() + device.expires_in * 1000).toISOString();
     const states = [
@@ -701,10 +726,8 @@ class VwWeconnect extends utils.Adapter {
     this.refreshTokenInterval = setInterval(async () => {
       try {
         if (this.seatCupraPollingStopped) {
-          this.seatCupraForcedReloginAttempted = false;
-          this.seatCupraMissingDeviceWarningLogged = false;
           this.seatCupraPollingStopped = false;
-          await this.loginSeatCupraDeviceFlow({ force: true });
+          await this.loginSeatCupraDeviceFlow({ forceFreshDeviceLogin: true });
           await this.getPersonalData();
           return;
         }
@@ -712,7 +735,7 @@ class VwWeconnect extends utils.Adapter {
       } catch (error) {
         this.log.error("SEAT/CUPRA token refresh failed; starting Device Authorization login: " + redactSecrets(error.message || error));
         try {
-          await this.loginSeatCupraDeviceFlow({ force: true });
+          await this.loginSeatCupraDeviceFlow({ forceFreshDeviceLogin: true });
           await this.getPersonalData();
         } catch (loginError) {
           this.seatCupraPollingStopped = true;
@@ -722,14 +745,14 @@ class VwWeconnect extends utils.Adapter {
     }, refreshIn);
   }
 
-  async loginSeatCupraDeviceFlow({ force = false } = {}) {
+  async loginSeatCupraDeviceFlow({ forceFreshDeviceLogin = false } = {}) {
     const brand = getSeatCupraBrandConfig(this.config.type);
     const grant = this.getSeatCupraDeviceGrant();
     this.clientId = brand.clientId;
     this.scope = brand.scope;
     this.userAgent = brand.oauthUserAgent;
 
-    if (!force && this.config.rtoken) {
+    if (shouldUseSeatCupraRefreshToken(forceFreshDeviceLogin, this.config.rtoken)) {
       try {
         const refreshed = await grant.refreshToken(this.config.rtoken, {
           clientSecret: brand.clientSecret,
@@ -745,7 +768,12 @@ class VwWeconnect extends utils.Adapter {
       }
     }
 
-    const device = await grant.requestDeviceCode();
+    this.log.info("SEAT/CUPRA fresh Device Authorization login started");
+    const device = await startSeatCupraDeviceAuthorization({
+      forceFreshDeviceLogin,
+      clearTokens: () => this.clearSeatCupraTokens(),
+      requestDeviceCode: () => grant.requestDeviceCode(),
+    });
     await this.setSeatCupraDeviceApprovalStates(device);
     try {
       await this.autoApproveSeatCupraDevice(device, brand);
@@ -768,7 +796,7 @@ class VwWeconnect extends utils.Adapter {
     }
     this.scheduleSeatCupraTokenRefresh();
     this.seatCupraPollingStopped = false;
-    this.log.info("SEAT/CUPRA Device Authorization login successful");
+    this.log.info("SEAT/CUPRA fresh Device Authorization login successful");
   }
 
   /**
@@ -1881,8 +1909,9 @@ class VwWeconnect extends utils.Adapter {
       });
       return;
     } else if (this.config.type === "seatcupra" || this.config.type === "seat") {
+      const recoveryContext = { recoveryAttempted: false, skipRemaining: false, failureLogged: false };
       this.vinArray.forEach((vin) => {
-        this.getSeatCupraStatus(vin);
+        this.getSeatCupraStatus(vin, recoveryContext);
       });
       return;
     } else if (this.config.type === "seatelli" || this.config.type === "skodapower") {
@@ -2672,7 +2701,7 @@ class VwWeconnect extends utils.Adapter {
       olaUsers: async () => this.seatCupraOlaRequest(
         "get",
         "https://ola.prod.code.seat.cloud.vwgroup.com/v1/users",
-        { suppressErrorLog: true },
+        { suppressErrorLog: true, disableMissingDeviceRecovery: true },
       ),
     });
   }
@@ -2790,37 +2819,44 @@ class VwWeconnect extends utils.Adapter {
   }
 
   async recoverSeatCupraMissingDeviceToken() {
-    if (this.seatCupraPollingStopped) throw new Error("SEAT/CUPRA polling is stopped for this adapter run");
-    if (!this.seatCupraMissingDeviceWarningLogged) {
-      this.log.warn("SEAT/CUPRA OLA rejected token as missing device token; forcing Device Authorization re-login");
-      this.seatCupraMissingDeviceWarningLogged = true;
+    if (!this.seatCupraMissingDeviceRecoveryInProgress) {
+      this.log.warn(
+        "SEAT/CUPRA OLA rejected token as missing device token; forcing fresh Device Authorization login",
+      );
+      this.seatCupraMissingDeviceRecoveryInProgress = runSeatCupraFreshRecovery({
+        login: (options) => this.loginSeatCupraDeviceFlow(options),
+        resolveUserId: async () => {
+          this.seatcupraUser = await this.resolveSeatCupraUserId();
+        },
+      }).finally(() => {
+        this.seatCupraMissingDeviceRecoveryInProgress = null;
+      });
     }
-    this.config.atoken = "";
-    if (this.seatCupraReloginPromise) return this.seatCupraReloginPromise;
-    if (this.seatCupraForcedReloginAttempted) {
-      this.seatCupraPollingStopped = true;
-      throw new Error("SEAT/CUPRA Device Authorization re-login already failed for this adapter run");
-    }
-    this.seatCupraForcedReloginAttempted = true;
-    if (!this.seatCupraReloginPromise) {
-      this.seatCupraReloginPromise = (async () => {
-        try {
-          await this.loginSeatCupraDeviceFlow({ force: true });
-        } catch (error) {
-          this.seatCupraPollingStopped = true;
-          throw error;
-        } finally {
-          this.seatCupraReloginPromise = null;
-        }
-      })();
-    }
-    return this.seatCupraReloginPromise;
+    return this.seatCupraMissingDeviceRecoveryInProgress;
+  }
+
+  logSeatCupraOlaFailure(method, endpoint, status, data) {
+    this.log.error(formatSeatCupraOlaFailure({
+      method,
+      url: endpoint,
+      status,
+      data,
+      redact: redactSecrets,
+    }));
   }
 
   async seatCupraOlaRequest(
     method,
     url,
-    { data, vin, extraHeaders = {}, authRetried = false, suppressErrorLog = false } = {},
+    {
+      data,
+      vin,
+      extraHeaders = {},
+      authRetried = false,
+      suppressErrorLog = false,
+      disableMissingDeviceRecovery = false,
+      recoveryContext = {},
+    } = {},
   ) {
     if (this.seatCupraPollingStopped) throw new Error("SEAT/CUPRA polling is stopped for this adapter run");
     let response;
@@ -2847,24 +2883,42 @@ class VwWeconnect extends utils.Adapter {
     }
 
     if (response && response.status === 403 && isMissingDeviceToken(response.data)) {
-      if (authRetried) {
-        this.seatCupraPollingStopped = true;
-        throw new Error("SEAT/CUPRA OLA still reports missing-device-token after Device Authorization re-login");
+      if (!suppressErrorLog && !recoveryContext.failureLogged) {
+        this.logSeatCupraOlaFailure(method, endpoint, response.status, response.data);
+        recoveryContext.failureLogged = true;
       }
-      await this.recoverSeatCupraMissingDeviceToken();
-      return this.seatCupraOlaRequest(method, url, {
-        data,
-        vin,
-        extraHeaders,
-        authRetried: true,
-        suppressErrorLog,
-      });
+      if (disableMissingDeviceRecovery) {
+        const error = new Error(`SEAT/CUPRA OLA missing-device-token: ${String(method).toUpperCase()} ${endpoint}`);
+        error.response = response;
+        throw error;
+      }
+      if (!beginSeatCupraMissingDeviceRecovery(authRetried, recoveryContext)) {
+        throw new Error(
+          `SEAT/CUPRA OLA still reports missing-device-token after fresh Device Authorization login: ` +
+            `${String(method).toUpperCase()} ${endpoint}`,
+        );
+      }
+      try {
+        return await retrySeatCupraRequestAfterRecovery({
+          recover: () => this.recoverSeatCupraMissingDeviceToken(),
+          retryRequest: () => this.seatCupraOlaRequest(method, url, {
+            data,
+            vin,
+            extraHeaders,
+            authRetried: true,
+            suppressErrorLog,
+            disableMissingDeviceRecovery,
+            recoveryContext,
+          }),
+        });
+      } catch (error) {
+        if (!error.response) recoveryContext.skipRemaining = true;
+        throw error;
+      }
     }
+
     const status = response ? response.status : "network_error";
-    const body = response ? redactSecrets(response.data) : "no response";
-    if (!suppressErrorLog) {
-      this.log.error(`SEAT/CUPRA OLA request failed: ${endpoint} status=${status} body=${body}`);
-    }
+    if (!suppressErrorLog) this.logSeatCupraOlaFailure(method, endpoint, status, response && response.data);
     const error = new Error(`SEAT/CUPRA OLA request failed (${status})`);
     error.response = response;
     throw error;
@@ -4679,7 +4733,10 @@ class VwWeconnect extends utils.Adapter {
       }
     });
   }
-  async getSeatCupraStatus(vin) {
+  async getSeatCupraStatus(
+    vin,
+    recoveryContext = { recoveryAttempted: false, skipRemaining: false, failureLogged: false },
+  ) {
     const endpoints = [
       {
         url: `https://ola.prod.code.seat.cloud.vwgroup.com/v3/vehicles/${vin}/warninglights`,
@@ -4746,13 +4803,13 @@ class VwWeconnect extends utils.Adapter {
       this.log.debug("Skip trip check because of last check was less than 60min ago");
     }
     for (const endpoint of endpoints) {
-      if (this.seatCupraPollingStopped) return;
+      if (this.seatCupraPollingStopped || recoveryContext.skipRemaining) return;
       if (this.ignoredPaths[vin] && this.ignoredPaths[vin].includes(endpoint.path)) {
         this.log.debug("Ignored path: " + endpoint.path);
         continue;
       }
 
-      await this.seatCupraOlaRequest("get", endpoint.url, { vin })
+      await this.seatCupraOlaRequest("get", endpoint.url, { vin, recoveryContext })
         .then(async (responseData) => {
           this.log.debug("Received data for " + endpoint.path);
           this.log.debug(JSON.stringify(responseData));
@@ -4792,7 +4849,7 @@ class VwWeconnect extends utils.Adapter {
           }
         })
         .catch((error) => {
-          if (this.seatCupraPollingStopped) return;
+          if (this.seatCupraPollingStopped || recoveryContext.skipRemaining) return;
           if (error.response && (error.response.status === 400 || error.response.status === 404)) {
             this.log.info("Vehicle is not supporting: " + endpoint.path);
             if (!this.ignoredPaths[vin]) {
