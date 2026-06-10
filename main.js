@@ -21,7 +21,8 @@ const { OAuthDeviceGrant, redactSecrets } = require("./lib/oauthDeviceGrant");
 const {
   resolveSeatCupraUserId: resolveSeatCupraUserIdFromSources,
   getSeatCupraGarageUrl,
-  clearSeatCupraTokenValues,
+  storeSeatCupraTokenValues,
+  clearSeatCupraRuntimeTokens,
   runSeatCupraFreshRecovery,
   retrySeatCupraRequestAfterRecovery,
   startSeatCupraDeviceAuthorization,
@@ -600,48 +601,13 @@ class VwWeconnect extends utils.Adapter {
   }
 
   async storeSeatCupraTokens(tokens) {
-    this.config.atoken = tokens.access_token;
-    if (tokens.refresh_token) this.config.rtoken = tokens.refresh_token;
-    if (tokens.id_token) {
-      this.config.seatCupraIdToken = tokens.id_token;
-      this.config.idtoken = tokens.id_token;
-    }
-    const expiresIn = Number(tokens.expires_in || 3600);
-    this.seatCupraTokenExpiresAt = Date.now() + expiresIn * 1000;
-    this.config.seatCupraTokenExpiresAt = this.seatCupraTokenExpiresAt;
-
-    // Persist rotating tokens in the adapter's native configuration, matching
-    // the existing atoken/rtoken storage convention without ever logging them.
-    try {
-      const obj = await this.getForeignObjectAsync("system.adapter." + this.namespace);
-      if (obj && obj.native) {
-        obj.native.atoken = this.config.atoken;
-        obj.native.rtoken = this.config.rtoken;
-        if (this.config.seatCupraIdToken || this.config.idtoken) {
-          obj.native.seatCupraIdToken = this.config.seatCupraIdToken || this.config.idtoken;
-          obj.native.idtoken = this.config.seatCupraIdToken || this.config.idtoken;
-        }
-        obj.native.seatCupraTokenExpiresAt = this.seatCupraTokenExpiresAt;
-        await this.setForeignObjectAsync("system.adapter." + this.namespace, obj);
-      }
-    } catch (error) {
-      this.log.debug("SEAT/CUPRA token persistence failed (non-fatal): " + redactSecrets(error.message || error));
-    }
+    // Tokens are kept in memory to avoid runtime native config writes that can restart the adapter.
+    storeSeatCupraTokenValues(this.config, this, tokens);
   }
 
   async clearSeatCupraTokens() {
-    clearSeatCupraTokenValues(this.config);
-    this.seatCupraTokenExpiresAt = 0;
-    this.seatcupraUser = undefined;
-    try {
-      const obj = await this.getForeignObjectAsync("system.adapter." + this.namespace);
-      if (obj && obj.native) {
-        clearSeatCupraTokenValues(obj.native);
-        await this.setForeignObjectAsync("system.adapter." + this.namespace, obj);
-      }
-    } catch (error) {
-      throw new Error("SEAT/CUPRA stale token persistence could not be cleared", { cause: error });
-    }
+    // Tokens are kept in memory to avoid runtime native config writes that can restart the adapter.
+    clearSeatCupraRuntimeTokens(this.config, this);
   }
 
   async setSeatCupraDeviceApprovalStates(device) {

@@ -9,6 +9,8 @@ const {
   resolveSeatCupraUserId,
   getSeatCupraGarageUrl,
   clearSeatCupraTokenValues,
+  storeSeatCupraTokenValues,
+  clearSeatCupraRuntimeTokens,
   runSeatCupraFreshRecovery,
   retrySeatCupraRequestAfterRecovery,
   startSeatCupraDeviceAuthorization,
@@ -199,6 +201,59 @@ describe("SEAT/CUPRA fresh device recovery", () => {
     expect(shouldUseSeatCupraRefreshToken(true, "stale-refresh")).to.equal(false);
   });
 
+  it("stores tokens only in memory without adapter config or lifecycle calls", () => {
+    let nativeWrites = 0;
+    let restarts = 0;
+    let terminates = 0;
+    const config = { rtoken: "preserved-refresh", seatCupraIdToken: "preserved-id" };
+    const runtime = {
+      seatCupraTokenExpiresAt: 0,
+      setForeignObjectAsync: () => { nativeWrites++; },
+      restart: () => { restarts++; },
+      terminate: () => { terminates++; },
+    };
+    storeSeatCupraTokenValues(config, runtime, { access_token: "new-access", expires_in: 60 }, 1000);
+    expect(config.atoken).to.equal("new-access");
+    expect(config.rtoken).to.equal("preserved-refresh");
+    expect(config.seatCupraIdToken).to.equal("preserved-id");
+    expect(config.seatCupraTokenExpiresAt).to.equal(61000);
+    expect(runtime.seatCupraTokenExpiresAt).to.equal(61000);
+    expect(nativeWrites).to.equal(0);
+    expect(restarts).to.equal(0);
+    expect(terminates).to.equal(0);
+  });
+
+  it("clears tokens only in memory without adapter config or lifecycle calls", () => {
+    let nativeWrites = 0;
+    let restarts = 0;
+    let terminates = 0;
+    const config = {
+      atoken: "old-access",
+      rtoken: "old-refresh",
+      idtoken: "old-id",
+      seatCupraIdToken: "old-seat-id",
+      seatCupraTokenExpiresAt: 123,
+    };
+    const runtime = {
+      seatCupraTokenExpiresAt: 123,
+      seatcupraUser: "user-id",
+      setForeignObjectAsync: () => { nativeWrites++; },
+      restart: () => { restarts++; },
+      terminate: () => { terminates++; },
+    };
+    clearSeatCupraRuntimeTokens(config, runtime);
+    expect(config.atoken).to.equal("");
+    expect(config.rtoken).to.equal("");
+    expect(config.idtoken).to.equal("");
+    expect(config.seatCupraIdToken).to.equal("");
+    expect(config.seatCupraTokenExpiresAt).to.equal(0);
+    expect(runtime.seatCupraTokenExpiresAt).to.equal(0);
+    expect(runtime.seatcupraUser).to.equal(undefined);
+    expect(nativeWrites).to.equal(0);
+    expect(restarts).to.equal(0);
+    expect(terminates).to.equal(0);
+  });
+
   it("clears old access, refresh, and ID tokens before fresh authorization", () => {
     const config = {
       atoken: "old-access",
@@ -296,6 +351,17 @@ describe("SEAT/CUPRA fresh device recovery", () => {
     expect(state.idtoken).to.equal("");
     expect(state.seatCupraIdToken).to.equal("");
     expect(state.seatCupraPollingStopped).to.equal(true);
+  });
+
+  it("contains no native config writes in adapter token store or clear methods", () => {
+    const source = require("fs").readFileSync(require("path").join(__dirname, "..", "main.js"), "utf8");
+    const start = source.indexOf("  async storeSeatCupraTokens(tokens) {");
+    const end = source.indexOf("  async setSeatCupraDeviceApprovalStates", start);
+    const tokenMethods = source.slice(start, end);
+    expect(tokenMethods).not.to.include("getForeignObjectAsync");
+    expect(tokenMethods).not.to.include("setForeignObjectAsync");
+    expect(tokenMethods).not.to.include("restart(");
+    expect(tokenMethods).not.to.include("terminate(");
   });
 
   it("formats OLA failures with pathname and status without secrets", () => {
