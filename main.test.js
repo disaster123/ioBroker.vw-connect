@@ -61,6 +61,7 @@ describe("adapter startup data source selection", () => {
     adapter.getPersonalData = sinon.spy();
     adapter.getVehicles = sinon.spy();
     adapter.getSeatCupraStatus = sinon.spy();
+    adapter.restart = sinon.spy();
 
     return adapter;
   }
@@ -96,6 +97,7 @@ describe("adapter startup data source selection", () => {
   for (const [type, brand] of [
     ["seat", "SEAT"],
     ["audietron", "AUDI"],
+    ["skoda", "SKODA"],
   ]) {
     it(`keeps the legacy login startup behavior for ${type}`, async () => {
       const adapter = createStartupAdapter(type);
@@ -107,6 +109,88 @@ describe("adapter startup data source selection", () => {
       sinon.assert.calledOnceWithExactly(adapter.subscribeStates, "*");
     });
   }
+
+
+  async function flushStartupRecovery() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it("schedules a delayed restart after a transient My CUPRA EU Data Act startup failure", async () => {
+    const clock = sinon.useFakeTimers();
+    try {
+      const adapter = createStartupAdapter("seatcupra");
+      adapter.runEuDataAct.rejects(new Error("HTTP 500 backend unavailable"));
+
+      await adapter.onReady();
+      await flushStartupRecovery();
+
+      sinon.assert.calledOnceWithExactly(adapter.runEuDataAct, "CUPRA");
+      sinon.assert.notCalled(adapter.login);
+      sinon.assert.calledOnceWithExactly(adapter.subscribeStates, "*");
+      sinon.assert.calledWithExactly(
+        adapter.log.warn,
+        "My CUPRA: EU Data Act setup failed (HTTP 500 backend unavailable). Will restart adapter in 30 min.",
+      );
+      sinon.assert.notCalled(adapter.restart);
+
+      await clock.tickAsync(30 * 60 * 1000);
+
+      sinon.assert.calledOnce(adapter.restart);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it("does not restart My CUPRA after an EU Data Act credential or account rejection", async () => {
+    const clock = sinon.useFakeTimers();
+    try {
+      const adapter = createStartupAdapter("seatcupra");
+      adapter.runEuDataAct.rejects(new Error("Login failed: account locked"));
+
+      await adapter.onReady();
+      await flushStartupRecovery();
+
+      sinon.assert.notCalled(adapter.login);
+      sinon.assert.calledWithExactly(
+        adapter.log.error,
+        "My CUPRA: EU Data Act login refused. Adapter staying down until " +
+          "credentials are corrected. Update user/password in the adapter settings, then restart manually.",
+      );
+      sinon.assert.calledWithExactly(adapter.setState, "info.connection", false, true);
+      expect(adapter.restartTimeout).to.equal(undefined);
+
+      await clock.tickAsync(30 * 60 * 1000);
+
+      sinon.assert.notCalled(adapter.restart);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it("keeps VW ID transient EU Data Act startup recovery unchanged", async () => {
+    const clock = sinon.useFakeTimers();
+    try {
+      const adapter = createStartupAdapter("id");
+      adapter.runEuDataAct.rejects(new Error("temporary network failure"));
+
+      await adapter.onReady();
+      await flushStartupRecovery();
+
+      sinon.assert.notCalled(adapter.login);
+      sinon.assert.calledWithExactly(
+        adapter.log.warn,
+        "VW ID: EU Data Act setup failed (temporary network failure). Will restart adapter in 30 min.",
+      );
+      sinon.assert.notCalled(adapter.restart);
+
+      await clock.tickAsync(30 * 60 * 1000);
+
+      sinon.assert.calledOnce(adapter.restart);
+    } finally {
+      clock.restore();
+    }
+  });
 
   function createEuDataActStatusAdapter(vin, datasets, downloads) {
     const adapter = createAdapter({ config: { password: "test-password", type: "seatcupra" } });

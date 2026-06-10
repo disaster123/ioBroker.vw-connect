@@ -331,6 +331,7 @@ class VwWeconnect extends utils.Adapter {
       seatcupra: "CUPRA",
       seat: "SEAT",
     }[this.config.type];
+    const isEuDataActOnlyType = this.config.type === "id" || this.config.type === "seatcupra";
     if (euDataActBrand) {
       this.runEuDataAct(euDataActBrand).catch((err) => {
         const msg = (err && err.message) || String(err);
@@ -340,16 +341,14 @@ class VwWeconnect extends utils.Adapter {
             "log in once at https://eu-data-act.drivesomethinggreater.com/, link " +
             "your vehicle and configure a continuous 15-minute data request.",
         );
-        // Recovery for type=id: it's the only data source, so a transient
-        // failure (network blip, portal 5xx) shouldn't leave the adapter
-        // dead until a manual restart. Schedule a restart in 30 min.
-        // Credential / account errors (wrong password, account locked,
-        // not entitled) do NOT trigger restart — those don't self-heal,
-        // the user must fix the config.
-        if (this.config.type === "id") {
+        // EU Data Act-only types must recover from transient startup failures
+        // without falling back to an unavailable legacy API. Credential and
+        // account errors do not self-heal, so they require a manual correction.
+        if (isEuDataActOnlyType) {
+          const typeLabel = this.config.type === "seatcupra" ? "My CUPRA" : "VW ID";
           if (/login failed|password_invalid|email_invalid|account.*(locked|disabled)|not entitled/i.test(msg)) {
             this.log.error(
-              "VW ID: EU Data Act login refused. Adapter staying down until " +
+              `${typeLabel}: EU Data Act login refused. Adapter staying down until ` +
                 "credentials are corrected. Update user/password in the adapter " +
                 "settings, then restart manually.",
             );
@@ -357,7 +356,7 @@ class VwWeconnect extends utils.Adapter {
             return;
           }
           this.log.warn(
-            `VW ID: EU Data Act setup failed (${msg}). Will restart adapter in 30 min.`,
+            `${typeLabel}: EU Data Act setup failed (${msg}). Will restart adapter in 30 min.`,
           );
           this.restartTimeout && clearTimeout(this.restartTimeout);
           this.restartTimeout = setTimeout(() => {
