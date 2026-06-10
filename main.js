@@ -319,9 +319,9 @@ class VwWeconnect extends utils.Adapter {
     //
     // Map adapter type -> EU Data Act brand key. For types where the user's
     // VW-Group account is the same one that authenticates the brand-specific
-    // app, the portal accepts those credentials. Audi/Skoda/Cupra/Seat are
-    // OPTIONAL just like the VW path: the legacy brand login below remains
-    // the primary source.
+    // app, the portal accepts those credentials. Audi/Skoda/Seat keep their
+    // legacy brand login below. CUPRA uses this portal as its only data source
+    // because its legacy OLA detail API rejects requests without a device token.
     const euDataActBrand = {
       id: "VOLKSWAGEN_PASSENGER_CARS",
       audietron: "AUDI",
@@ -366,8 +366,8 @@ class VwWeconnect extends utils.Adapter {
           }, 30 * 60 * 1000);
         }
       });
-      // For non-id brands we fall through to this.login() below; for
-      // type=id the early return after this block skips it entirely.
+      // Most brands fall through to this.login() below. The early returns
+      // for type=id and type=seatcupra skip their unavailable legacy APIs.
     }
 
     // Tibber Data API as an additional optional source. Triggered for ANY
@@ -396,6 +396,15 @@ class VwWeconnect extends utils.Adapter {
         "Classic VW ID login (a24fba63 OAuth client) was retired by VW. " +
           "The adapter now relies exclusively on the EU Data Act portal " +
           "for VW ID vehicles. See README -> 'EU Data Act portal' for setup.",
+      );
+      this.subscribeStates("*");
+      return;
+    }
+
+    if (this.config.type === "seatcupra") {
+      this.log.info(
+        "My CUPRA: legacy OLA detail API is blocked by missing-device-token. " +
+          "Using EU Data Act as the only data source.",
       );
       this.subscribeStates("*");
       return;
