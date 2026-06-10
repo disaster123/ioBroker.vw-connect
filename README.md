@@ -82,6 +82,12 @@ Object tree per VIN once the EU Data Act side is active:
 - **Stale values**: the portal merges several report snapshots into one flat array per dataset. Where the same field appears multiple times with different values, the adapter deterministically picks the entry with the smallest UUID (stable across refreshes — same approach as the Home Assistant integration).
 - **Reference implementation** (Home Assistant, Python): <https://github.com/mikrohard/hass-vw-eu-data-act>
 
+## My CUPRA / My SEAT classic OLA login
+
+My CUPRA and My SEAT now use the OAuth Device Authorization Grant at `identity.vwgroup.io` for the existing classic OLA vehicle and status APIs. On the first start after updating, the adapter tries to confirm the browser/device login with the configured username and password. If automatic confirmation is blocked by MFA, captcha, or an identity-provider change, open the URL shown in the adapter log or in `info.seatCupraDeviceVerificationUrl` and confirm `info.seatCupraDeviceUserCode` before `info.seatCupraDeviceLoginExpires`.
+
+This repair does **not** route CUPRA or SEAT through the EU Data Act portal. EU Data Act support remains optional and unchanged; it is not required for classic OLA polling. The implementation is a clean JavaScript RFC 8628 implementation informed by the behavior documented in [`its-me-prash/vwgroup-connect-ha`](https://github.com/its-me-prash/vwgroup-connect-ha) and the adapter's existing Audi device flow.
+
 ## Usage
 
 Use the state under remote control to control your car remotely.
@@ -105,6 +111,7 @@ You can set climatisaton temperature in
 ```
 ### 0.9.4 (2026-06-06)
 - add tibber support
+- repair My CUPRA / My SEAT classic OLA access with OAuth Device Authorization Grant; first login may require browser/device confirmation, and EU Data Act remains optional
 
 ### 0.9.3 (2026-05-31)
 - improve eudata fetching
