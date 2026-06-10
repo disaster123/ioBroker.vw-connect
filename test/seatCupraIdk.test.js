@@ -13,7 +13,9 @@ const {
   buildSeatCupraTokenBody,
   getSeatCupraAuthStrategy,
   getSeatCupraMissingDeviceRecoveryStrategy,
+  decodeJwtMetadataSafe,
   decodeJwtMetadata,
+  upgradeSeatCupraClassicTokens,
 } = require("../lib/seatCupraIdk");
 const { getSeatCupraBrandConfig, getSeatCupraOlaHeaders } = require("../lib/seatCupra");
 
@@ -245,6 +247,92 @@ describe("SEAT/CUPRA classic IDK PKCE", () => {
     let transientError;
     try { await createAuth("seatcupra", transientRequest).refresh("refresh-token"); } catch (error) { transientError = error; }
     expect(transientError.transient).to.equal(true);
+  });
+
+  it("upgrades identity tokens via OLA refresh and preserves the original id_token", async () => {
+    const identityIdToken = encodeJwt({ aud: "identity-client", exp: 1900000000 });
+    let refreshCalls = 0;
+    const result = await upgradeSeatCupraClassicTokens({
+      access_token: "identity-access",
+      refresh_token: "identity-refresh",
+      id_token: identityIdToken,
+      expires_in: 3600,
+    }, async (refreshToken) => {
+      refreshCalls++;
+      expect(refreshToken).to.equal("identity-refresh");
+      return { access_token: "ola-access", refresh_token: "ola-refresh", expires_in: 3600 };
+    });
+    expect(refreshCalls).to.equal(1);
+    expect(result.origin).to.equal("classic_idk_ola_refresh");
+    expect(result.outcome).to.equal("upgraded");
+    expect(result.tokens.access_token).to.equal("ola-access");
+    expect(result.tokens.refresh_token).to.equal("ola-refresh");
+    expect(result.tokens.id_token).to.equal(identityIdToken);
+  });
+
+  it("keeps identity tokens when the immediate OLA refresh is transient or rejected", async () => {
+    const identityTokens = {
+      access_token: "identity-access",
+      refresh_token: "identity-refresh",
+      id_token: "identity-id",
+    };
+    for (const [error, outcome] of [
+      [Object.assign(new Error("temporary"), { transient: true }), "transient"],
+      [Object.assign(new Error("invalid grant"), { invalidGrant: true }), "rejected"],
+    ]) {
+      let calls = 0;
+      const result = await upgradeSeatCupraClassicTokens(identityTokens, async () => {
+        calls++;
+        throw error;
+      });
+      expect(calls).to.equal(1);
+      expect(result.outcome).to.equal(outcome);
+      expect(result.origin).to.equal("classic_idk_identity_exchange");
+      expect(result.tokens).to.deep.equal(identityTokens);
+    }
+  });
+
+  it("reports access_token and id_token metadata separately without subject or raw tokens", () => {
+    const accessToken = encodeJwt({
+      sub: "private-user",
+      aud: "ola-api",
+      exp: 1900000000,
+      scope: "openid profile",
+    });
+    const idToken = encodeJwt({ sub: "private-user", aud: "cupra-client", exp: 1900000100 });
+    const accessMetadata = decodeJwtMetadataSafe(accessToken, "access_token", "classic_idk");
+    const idMetadata = decodeJwtMetadataSafe(idToken, "id_token", "classic_idk");
+    expect(accessMetadata).to.include({
+      label: "access_token",
+      strategy: "classic_idk",
+      exists: true,
+      len: accessToken.length,
+      aud: "ola-api",
+      scope: "openid profile",
+    });
+    expect(idMetadata).to.include({
+      label: "id_token",
+      strategy: "classic_idk",
+      exists: true,
+      len: idToken.length,
+      aud: "cupra-client",
+    });
+    const output = JSON.stringify([accessMetadata, idMetadata]);
+    expect(output).not.to.include("private-user");
+    expect(output).not.to.include(accessToken);
+    expect(output).not.to.include(idToken);
+    expect(accessMetadata).not.to.have.property("sub");
+    expect(idMetadata).not.to.have.property("sub");
+  });
+
+  it("wires the immediate OLA upgrade into fresh classic login", () => {
+    const source = require("fs").readFileSync(require("path").join(__dirname, "..", "main.js"), "utf8");
+    const start = source.indexOf("  async loginSeatCupraClassicIdk(");
+    const end = source.indexOf("  async loginSeatCupra(", start);
+    const loginMethod = source.slice(start, end);
+    expect(loginMethod).to.include("upgradeSeatCupraClassicTokens(tokens");
+    expect(loginMethod).to.include("auth.refresh(refreshToken)");
+    expect(loginMethod).to.include("classic_idk_ola_refresh");
   });
 
   it("switches Device Grant missing-device-token recovery to classic IDK", () => {

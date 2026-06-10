@@ -33,6 +33,7 @@ const {
   getSeatCupraDefaultStatusEndpoints,
   formatSeatCupraOlaRequest,
   requestSeatCupraWithServerRetry,
+  summarizeSeatCupraEndpointResults,
   shouldRecoverSeatCupraAuthentication,
 } = require("../lib/seatCupra");
 
@@ -445,24 +446,29 @@ describe("SEAT/CUPRA optional OLA endpoints", () => {
     expect(terminates).to.equal(0);
   });
 
-  it("stops only the detail cycle for a repeated core endpoint failure", async () => {
+  it("returns a controlled failure for repeated detail endpoint rejection", async () => {
     const context = { recoveryAttempted: true, stopDetailPolling: false };
-    const errors = [];
+    const skipped = [];
+    const warnings = [];
     const result = await handleSeatCupraRepeatedMissingDeviceToken({
       method: "get",
       pathname: "/v2/vehicles/VIN/status",
       status: 403,
       data: missingDevice,
       recoveryContext: context,
-      recordSkipped: async () => { throw new Error("core endpoint must not be skipped"); },
-      logWarning: () => {},
-      logError: (message) => errors.push(message),
+      recordSkipped: async (...args) => skipped.push(args),
+      logWarning: (message) => warnings.push(message),
+      logError: () => {},
       completeRecovery: () => {},
     });
-    expect(result.stopCycle).to.equal(true);
-    expect(result.skipped).to.equal(false);
-    expect(context.stopDetailPolling).to.equal(true);
-    expect(errors[0]).to.include("core OLA endpoint rejected token after fresh login");
+    expect(result).to.deep.equal({
+      skipped: true,
+      stopCycle: false,
+      category: "missing-device-token",
+    });
+    expect(context.stopDetailPolling).to.equal(false);
+    expect(skipped).to.have.length(1);
+    expect(warnings).to.deep.equal([]);
   });
 
   it("allows polling to continue after an optional endpoint returns null", () => {
@@ -579,6 +585,46 @@ describe("SEAT/CUPRA mycar soft failure and header probe", () => {
   });
 });
 
+describe("SEAT/CUPRA endpoint aggregation", () => {
+  it("aggregates multiple missing-device-token failures with the real status", () => {
+    const results = [
+      {
+        ok: false,
+        path: "status",
+        pathname: "/v5/users/user/vehicles/VIN/mycar",
+        status: 403,
+        code: "missing-device-token",
+        category: "mycar",
+      },
+      {
+        ok: false,
+        path: "ranges",
+        pathname: "/v1/vehicles/VIN/ranges",
+        status: 403,
+        code: "missing-device-token",
+        category: "missing-device-token",
+      },
+      { ok: true, path: "charging", data: { charging: false } },
+    ];
+    const summary = summarizeSeatCupraEndpointResults(
+      results,
+      "classic_idk_ola_refresh",
+      new Date("2026-06-10T00:00:00.000Z"),
+    );
+    expect(summary).to.deep.equal({
+      tokenOrigin: "classic_idk_ola_refresh",
+      success: 1,
+      failed: 2,
+      missingDevice: 2,
+      firstFailure: "GET /v5/users/user/vehicles/VIN/mycar",
+      firstFailureStatus: 403,
+      firstFailureCode: "missing-device-token",
+      lastUpdate: "2026-06-10T00:00:00.000Z",
+    });
+    expect(summary.firstFailureStatus).not.to.equal("network_error");
+  });
+});
+
 describe("SEAT/CUPRA OLA request compatibility", () => {
   it("builds effective CUPRA read headers", () => {
     const headers = getSeatCupraOlaHeaders("seatcupra", "user-id", "access-token", "primary", "VIN");
@@ -642,7 +688,8 @@ describe("SEAT/CUPRA OLA request compatibility", () => {
     );
     expect(message).to.equal(
       "SEAT/CUPRA OLA request: GET /v1/vehicles/VIN/ranges brand=cupra appVersion=2.15.0 " +
-        'userAgent="OLACupra/2.15.0 (Android 12; sdk_gphone64_x86_64; Google) Mobile" auth=yes',
+        'userAgent="OLACupra/2.15.0 (Android 12; sdk_gphone64_x86_64; Google) Mobile" ' +
+        "tokenOrigin=unknown auth=yes",
     );
     expect(message).not.to.include("secret-token");
     expect(message).not.to.include("?secret=value");

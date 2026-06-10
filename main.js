@@ -22,7 +22,8 @@ const {
   SeatCupraIdkAuth,
   getSeatCupraAuthStrategy,
   getSeatCupraMissingDeviceRecoveryStrategy,
-  decodeJwtMetadata,
+  decodeJwtMetadataSafe,
+  upgradeSeatCupraClassicTokens,
 } = require("./lib/seatCupraIdk");
 const {
   resolveSeatCupraUserId: resolveSeatCupraUserIdFromSources,
@@ -52,6 +53,7 @@ const {
   getSeatCupraDefaultStatusEndpoints,
   formatSeatCupraOlaRequest,
   requestSeatCupraWithServerRetry,
+  summarizeSeatCupraEndpointResults,
   getSeatCupraOlaErrorDetails,
   isMissingDeviceToken,
   shouldRecoverSeatCupraAuthentication,
@@ -100,6 +102,7 @@ class VwWeconnect extends utils.Adapter {
     this.seatCupraSkippedEndpoints = new Set();
     this.seatCupraSkippedEndpointDetails = [];
     this.seatCupraTokenStrategy = undefined;
+    this.seatCupraTokenOrigin = undefined;
     this.seatCupraOlaHeaderVariant = "A";
     this.seatCupraMycarProbeAttempted = false;
 
@@ -621,19 +624,33 @@ class VwWeconnect extends utils.Adapter {
     });
   }
 
-  async storeSeatCupraTokens(tokens, strategy = this.seatCupraTokenStrategy) {
+  async storeSeatCupraTokens(
+    tokens,
+    strategy = this.seatCupraTokenStrategy,
+    origin = this.seatCupraTokenOrigin,
+  ) {
     // Tokens are kept in memory to avoid runtime native config writes that can restart the adapter.
     storeSeatCupraTokenValues(this.config, this, tokens);
     this.seatCupraTokenStrategy = strategy;
+    this.seatCupraTokenOrigin = origin;
     this.log.debug("SEAT/CUPRA token metadata: " + JSON.stringify(
-      decodeJwtMetadata(tokens.id_token || tokens.access_token, strategy || "unknown"),
+      decodeJwtMetadataSafe(this.config.atoken, "access_token", strategy || "unknown"),
     ));
+    this.log.debug("SEAT/CUPRA token metadata: " + JSON.stringify(
+      decodeJwtMetadataSafe(
+        this.config.seatCupraIdToken || this.config.idtoken,
+        "id_token",
+        strategy || "unknown",
+      ),
+    ));
+    if (origin) this.log.info("SEAT/CUPRA active token origin: " + origin);
   }
 
   async clearSeatCupraTokens() {
     // Tokens are kept in memory to avoid runtime native config writes that can restart the adapter.
     clearSeatCupraRuntimeTokens(this.config, this);
     this.seatCupraTokenStrategy = undefined;
+    this.seatCupraTokenOrigin = undefined;
   }
 
   getSeatCupraIdkAuth() {
@@ -660,7 +677,7 @@ class VwWeconnect extends utils.Adapter {
     if (!force && this.seatCupraTokenStrategy === "classic_idk" && this.config.rtoken) {
       try {
         const refreshed = await auth.refresh(this.config.rtoken);
-        await this.storeSeatCupraTokens(refreshed, "classic_idk");
+        await this.storeSeatCupraTokens(refreshed, "classic_idk", "classic_idk_ola_refresh");
         this.scheduleSeatCupraTokenRefresh();
         this.log.info("SEAT/CUPRA classic IDK token refreshed");
         return;
@@ -673,7 +690,16 @@ class VwWeconnect extends utils.Adapter {
     await this.clearSeatCupraTokens();
     this.log.info("SEAT/CUPRA classic IDK login started");
     const tokens = await auth.authenticate();
-    await this.storeSeatCupraTokens(tokens, "classic_idk");
+    await this.storeSeatCupraTokens(tokens, "classic_idk", "classic_idk_identity_exchange");
+    const upgrade = await upgradeSeatCupraClassicTokens(tokens, (refreshToken) => auth.refresh(refreshToken));
+    if (upgrade.outcome === "upgraded") {
+      await this.storeSeatCupraTokens(upgrade.tokens, "classic_idk", upgrade.origin);
+      this.log.info("SEAT/CUPRA classic IDK token upgraded via OLA refresh");
+    } else if (upgrade.outcome === "transient") {
+      this.log.warn("SEAT/CUPRA OLA token upgrade temporarily unavailable; using identity exchange token");
+    } else if (upgrade.outcome === "rejected") {
+      this.log.warn("SEAT/CUPRA OLA token upgrade rejected; using identity exchange token");
+    }
     this.scheduleSeatCupraTokenRefresh();
     this.seatCupraPollingStopped = false;
     this.log.info("SEAT/CUPRA classic IDK login successful");
@@ -824,7 +850,7 @@ class VwWeconnect extends utils.Adapter {
           clientSecret: brand.clientSecret,
           retryInvalidClientWithSecret: this.config.type === "seatcupra",
         });
-        await this.storeSeatCupraTokens(refreshed, "device_grant");
+        await this.storeSeatCupraTokens(refreshed, "device_grant", "device_grant");
         this.scheduleSeatCupraTokenRefresh();
         this.log.info("SEAT/CUPRA Device Authorization token refreshed");
         return;
@@ -856,7 +882,7 @@ class VwWeconnect extends utils.Adapter {
       expiresIn: device.expires_in,
       onSlowDown: (seconds) => this.log.debug(`SEAT/CUPRA device polling slowed to ${seconds}s`),
     });
-    await this.storeSeatCupraTokens(tokens, "device_grant");
+    await this.storeSeatCupraTokens(tokens, "device_grant", "device_grant");
     if (!this.config.seatCupraIdToken && !this.config.idtoken) {
       this.log.warn("SEAT/CUPRA Device Authorization returned no id_token; user id will be resolved from HTTP fallbacks");
     }
@@ -3042,7 +3068,7 @@ class VwWeconnect extends utils.Adapter {
             validateStatus: () => true,
           }),
           retryDelays: String(method).toLowerCase() === "get" ? undefined : [],
-          onAttempt: () => this.log.debug(formatSeatCupraOlaRequest(method, url, headers)),
+          onAttempt: () => this.log.debug(formatSeatCupraOlaRequest(method, url, headers, this.seatCupraTokenOrigin || "unknown")),
           onRetry: ({ attempt, delay, status }) => this.log.debug(
             `SEAT/CUPRA OLA server error status=${status}; retry ${attempt}/3 in ${delay}ms: ${endpoint}`,
           ),
@@ -4979,6 +5005,21 @@ class VwWeconnect extends utils.Adapter {
     }
   }
 
+  async updateSeatCupraEndpointStatus(summary) {
+    await this.extendObjectAsync("info.seatCupraEndpointStatus", {
+      type: "state",
+      common: {
+        name: "SEAT/CUPRA OLA detail endpoint polling status",
+        type: "json",
+        role: "json",
+        read: true,
+        write: false,
+      },
+      native: {},
+    });
+    await this.setStateAsync("info.seatCupraEndpointStatus", JSON.stringify(summary), true);
+  }
+
   async getSeatCupraStatus(
     vin,
     recoveryContext = { recoveryAttempted: false, stopDetailPolling: false, failureLogged: false },
@@ -5003,7 +5044,11 @@ class VwWeconnect extends utils.Adapter {
           this.log.info("Vehicle is not supporting: " + result.path);
           if (!this.ignoredPaths[vin]) this.ignoredPaths[vin] = [];
           this.ignoredPaths[vin].push(result.path);
-        } else if (result.category !== "mycar" && result.category !== "optional") {
+        } else if (
+          result.category !== "mycar" &&
+          result.category !== "optional" &&
+          result.category !== "missing-device-token"
+        ) {
           this.log.error(
             `SEAT/CUPRA status request failed for ${result.path}: ` +
               `status=${result.status} code=${redactSecrets(result.code).slice(0, 100)}`,
@@ -5031,6 +5076,20 @@ class VwWeconnect extends utils.Adapter {
         });
         await this.setStateAsync(vin + "." + result.path + "rawJson", JSON.stringify(responseData), true);
       }
+    }
+    const summary = summarizeSeatCupraEndpointResults(results, this.seatCupraTokenOrigin);
+    const firstFailure = summary.firstFailure
+      ? `${summary.firstFailure} status=${summary.firstFailureStatus} code=${summary.firstFailureCode}`
+      : "none";
+    this.log.info(
+      `SEAT/CUPRA OLA detail polling completed: success=${summary.success} failed=${summary.failed} ` +
+        `missingDevice=${summary.missingDevice} firstFailure=${firstFailure} ` +
+        `tokenOrigin=${summary.tokenOrigin}`,
+    );
+    try {
+      await this.updateSeatCupraEndpointStatus(summary);
+    } catch (error) {
+      this.log.debug("SEAT/CUPRA endpoint status state update failed: " + redactSecrets(error.message || error));
     }
     return results;
   }
@@ -6190,12 +6249,12 @@ class VwWeconnect extends utils.Adapter {
         clientSecret: brand.clientSecret,
         retryInvalidClientWithSecret: this.config.type === "seatcupra",
       });
-      await this.storeSeatCupraTokens(tokens, "device_grant");
+      await this.storeSeatCupraTokens(tokens, "device_grant", "device_grant");
       this.log.info("SEAT/CUPRA Device Authorization token refreshed");
       return;
     }
     const tokens = await this.getSeatCupraIdkAuth().refresh(this.config.rtoken);
-    await this.storeSeatCupraTokens(tokens, "classic_idk");
+    await this.storeSeatCupraTokens(tokens, "classic_idk", "classic_idk_ola_refresh");
     this.log.info("SEAT/CUPRA classic IDK token refreshed");
   }
 
