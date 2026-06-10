@@ -24,6 +24,12 @@ const {
   createSeatCupraSkippedEndpointDetail,
   handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraOlaHeaders,
+  getSeatCupraOlaProbeVariants,
+  probeSeatCupraOlaHeaders,
+  beginSeatCupraHeaderProbe,
+  applySeatCupraProbeSelection,
+  isSeatCupraEndpointResultOk,
+  pollSeatCupraEndpoints,
   getSeatCupraDefaultStatusEndpoints,
   formatSeatCupraOlaRequest,
   requestSeatCupraWithServerRetry,
@@ -424,7 +430,7 @@ describe("SEAT/CUPRA optional OLA endpoints", () => {
       logError: () => {},
       completeRecovery: () => {},
     });
-    expect(result).to.deep.equal({ skipped: true, stopCycle: false });
+    expect(result).to.deep.equal({ skipped: true, stopCycle: false, category: "optional" });
     expect(context.stopDetailPolling).to.equal(false);
     expect(skipped.has("GET /v3/vehicles/VIN/warninglights")).to.equal(true);
     expect(details[0]).to.deep.equal({
@@ -467,6 +473,109 @@ describe("SEAT/CUPRA optional OLA endpoints", () => {
       processed.push(response);
     }
     expect(processed).to.deep.equal([{ range: 250 }]);
+  });
+});
+
+describe("SEAT/CUPRA mycar soft failure and header probe", () => {
+  const missingDevice = { code: "missing-device-token", message: "Forbidden device detected" };
+
+  it("treats mycar missing-device-token as soft and continues the endpoint poll", async () => {
+    const context = { recoveryAttempted: true, stopDetailPolling: false };
+    const warnings = [];
+    const skipped = [];
+    const result = await handleSeatCupraRepeatedMissingDeviceToken({
+      method: "get",
+      pathname: "/v5/users/user/vehicles/VIN/mycar",
+      status: 403,
+      data: missingDevice,
+      recoveryContext: context,
+      recordSkipped: async (...args) => skipped.push(args),
+      logWarning: (message) => warnings.push(message),
+      logError: () => {},
+      completeRecovery: () => {},
+    });
+    expect(result).to.deep.equal({ skipped: true, stopCycle: false, category: "mycar" });
+    expect(context.stopDetailPolling).to.equal(false);
+    expect(skipped).to.have.length(1);
+    expect(warnings).to.deep.equal([
+      "SEAT/CUPRA OLA mycar skipped: status=403 code=missing-device-token; continuing with other endpoints",
+    ]);
+
+    const requested = [];
+    const endpoints = ["status", "ranges", "statusv2", "charging", "climatisation"].map((path) => ({ path }));
+    const results = await pollSeatCupraEndpoints(endpoints, async (endpoint) => {
+      requested.push(endpoint.path);
+      if (endpoint.path === "status") {
+        return { ok: false, path: endpoint.path, status: 403, code: "missing-device-token", category: "mycar" };
+      }
+      return { ok: true, path: endpoint.path, data: { value: endpoint.path } };
+    });
+    expect(requested).to.deep.equal(["status", "ranges", "statusv2", "charging", "climatisation"]);
+    expect(results.filter(isSeatCupraEndpointResultOk).map((item) => item.path)).to.deep.equal([
+      "ranges", "statusv2", "charging", "climatisation",
+    ]);
+  });
+
+  it("does not expose failed mycar data to state parsing", () => {
+    const parsed = [];
+    const results = [
+      { ok: false, path: "status", data: null, category: "mycar" },
+      { ok: true, path: "ranges", data: { range: 250 } },
+    ];
+    for (const result of results) {
+      if (!isSeatCupraEndpointResultOk(result)) continue;
+      parsed.push([result.path, result.data]);
+    }
+    expect(parsed).to.deep.equal([["ranges", { range: 250 }]]);
+  });
+
+  it("probes A/B/C/D once, logs sanitized results, and selects a successful runtime variant", async () => {
+    const candidates = getSeatCupraOlaProbeVariants("seatcupra", "user-id", "access-token");
+    expect(candidates.map((candidate) => candidate.variant)).to.deep.equal(["A", "B", "C", "D"]);
+    expect(candidates[0].headers).not.to.have.property("User-ID");
+    expect(candidates[1].headers["User-Agent"]).to.equal(
+      "CUPRAApp%20-%20Store/20220503 CFNetwork/1333.0.4 Darwin/21.5.0",
+    );
+    expect(candidates[2].headers["User-ID"]).to.equal("user-id");
+    expect(candidates[3].headers["User-ID"]).to.equal("user-id");
+    for (const candidate of candidates) expect(candidate.headers).not.to.have.property("VIN");
+
+    const probeRuntime = { seatCupraMycarProbeAttempted: false };
+    expect(beginSeatCupraHeaderProbe(probeRuntime, true)).to.equal(true);
+    expect(beginSeatCupraHeaderProbe(probeRuntime, true)).to.equal(false);
+    expect(beginSeatCupraHeaderProbe({ seatCupraMycarProbeAttempted: false }, false)).to.equal(false);
+
+    const calls = [];
+    const logs = [];
+    const result = await probeSeatCupraOlaHeaders({
+      candidates,
+      request: async (candidate) => {
+        calls.push(candidate.variant);
+        if (candidate.variant === "B") return { status: 200, data: { vehicle: "ok" } };
+        return { status: 403, data: missingDevice };
+      },
+      logResult: (variant, status, code) => logs.push(`variant=${variant} status=${status} code=${code}`),
+    });
+    expect(calls).to.deep.equal(["A", "B", "C", "D"]);
+    expect(logs).to.deep.equal([
+      "variant=A status=403 code=missing-device-token",
+      "variant=B status=200 code=unknown",
+      "variant=C status=403 code=missing-device-token",
+      "variant=D status=403 code=missing-device-token",
+    ]);
+    const runtime = { seatCupraOlaHeaderVariant: "A" };
+    expect(applySeatCupraProbeSelection(runtime, result)).to.equal("B");
+    expect(runtime.seatCupraOlaHeaderVariant).to.equal("B");
+    const runtimeHeaders = getSeatCupraOlaHeaders("seatcupra", "user-id", "access-token", runtime.seatCupraOlaHeaderVariant);
+    expect(runtimeHeaders).not.to.have.property("User-ID");
+    expect(runtimeHeaders["User-Agent"]).to.equal(
+      "CUPRAApp%20-%20Store/20220503 CFNetwork/1333.0.4 Darwin/21.5.0",
+    );
+    const output = logs.join("\n");
+    expect(output).not.to.include("access-token");
+    expect(output).not.to.include("Bearer");
+    expect(output).not.to.include("Authorization");
+    expect(output).not.to.include("cookie");
   });
 });
 

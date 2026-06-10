@@ -37,14 +37,22 @@ const {
   completeSeatCupraMissingDeviceRecovery,
   failSeatCupraMissingDeviceRecovery,
   formatSeatCupraOlaFailure,
+  isSeatCupraMycarEndpoint,
   getSeatCupraSkippedEndpointKey,
   createSeatCupraSkippedEndpointDetail,
   handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraBrandConfig,
   getSeatCupraOlaHeaders,
+  getSeatCupraOlaProbeVariants,
+  probeSeatCupraOlaHeaders,
+  beginSeatCupraHeaderProbe,
+  applySeatCupraProbeSelection,
+  isSeatCupraEndpointResultOk,
+  pollSeatCupraEndpoints,
   getSeatCupraDefaultStatusEndpoints,
   formatSeatCupraOlaRequest,
   requestSeatCupraWithServerRetry,
+  getSeatCupraOlaErrorDetails,
   isMissingDeviceToken,
   shouldRecoverSeatCupraAuthentication,
 } = require("./lib/seatCupra");
@@ -92,6 +100,8 @@ class VwWeconnect extends utils.Adapter {
     this.seatCupraSkippedEndpoints = new Set();
     this.seatCupraSkippedEndpointDetails = [];
     this.seatCupraTokenStrategy = undefined;
+    this.seatCupraOlaHeaderVariant = "A";
+    this.seatCupraMycarProbeAttempted = false;
 
     this.homeRegion = {};
     this.homeRegionSetter = {};
@@ -2952,6 +2962,32 @@ class VwWeconnect extends utils.Adapter {
     }
   }
 
+  isSeatCupraHeaderProbeEnabled() {
+    const level = String(this.log.level || this.config.loglevel || "").toLowerCase();
+    return this.config.seatCupraProbeHeaders === true || level === "debug" || level === "silly";
+  }
+
+  async probeSeatCupraMycarHeaders(url) {
+    if (!beginSeatCupraHeaderProbe(this, this.isSeatCupraHeaderProbeEnabled())) return undefined;
+    const result = await probeSeatCupraOlaHeaders({
+      candidates: getSeatCupraOlaProbeVariants(this.config.type, this.seatcupraUser, this.config.atoken),
+      request: (candidate) => axios({
+        method: "get",
+        url,
+        headers: candidate.headers,
+        validateStatus: () => true,
+      }),
+      logResult: (variant, status, code) => this.log.debug(
+        `SEAT/CUPRA OLA mycar header probe: variant=${variant} ` +
+          `status=${status} code=${redactSecrets(String(code)).slice(0, 100)}`,
+      ),
+    });
+    if (!result) return undefined;
+    applySeatCupraProbeSelection(this, result);
+    this.log.info(`SEAT/CUPRA OLA header variant selected for this runtime: ${result.variant}`);
+    return result.data;
+  }
+
   logSeatCupraOlaFailure(method, endpoint, status, data) {
     this.log.error(formatSeatCupraOlaFailure({
       method,
@@ -2972,6 +3008,7 @@ class VwWeconnect extends utils.Adapter {
       authRetried = false,
       suppressErrorLog = false,
       disableMissingDeviceRecovery = false,
+      returnFailureResult = false,
       recoveryContext = {},
     } = {},
   ) {
@@ -2980,7 +3017,10 @@ class VwWeconnect extends utils.Adapter {
     const endpoint = new URL(url).pathname;
     const endpointKey = getSeatCupraSkippedEndpointKey(method, endpoint);
     if (this.seatCupraSkippedEndpoints.has(endpointKey)) return null;
-    for (const variant of ["primary", "fallback"]) {
+    const requestVariants = String(method).toLowerCase() === "get"
+      ? [this.seatCupraOlaHeaderVariant || "A", "fallback"]
+      : ["primary", "fallback"];
+    for (const variant of requestVariants) {
       try {
         const headers = {
           ...getSeatCupraOlaHeaders(
@@ -3023,6 +3063,13 @@ class VwWeconnect extends utils.Adapter {
         throw error;
       }
       if (!beginSeatCupraMissingDeviceRecovery(authRetried, recoveryContext)) {
+        if (isSeatCupraMycarEndpoint(endpoint)) {
+          const probeData = await this.probeSeatCupraMycarHeaders(url);
+          if (probeData !== undefined) {
+            completeSeatCupraMissingDeviceRecovery(this);
+            return probeData;
+          }
+        }
         const repeatedFailure = await handleSeatCupraRepeatedMissingDeviceToken({
           method,
           pathname: endpoint,
@@ -3034,7 +3081,17 @@ class VwWeconnect extends utils.Adapter {
           logError: (message) => this.log.error(redactSecrets(message)),
           completeRecovery: () => completeSeatCupraMissingDeviceRecovery(this),
         });
-        if (repeatedFailure.skipped) return null;
+        if (repeatedFailure.skipped) {
+          if (!returnFailureResult) return null;
+          const details = getSeatCupraOlaErrorDetails(response.data);
+          return {
+            __seatCupraEndpointFailure: true,
+            status: response.status,
+            code: details.code,
+            message: details.message,
+            category: repeatedFailure.category || "skipped",
+          };
+        }
         throw new Error(repeatedFailure.message);
       }
       try {
@@ -3047,6 +3104,7 @@ class VwWeconnect extends utils.Adapter {
             authRetried: true,
             suppressErrorLog,
             disableMissingDeviceRecovery,
+            returnFailureResult,
             recoveryContext,
           }),
         });
@@ -4874,63 +4932,109 @@ class VwWeconnect extends utils.Adapter {
       }
     });
   }
+  async getSeatCupraEndpointResult(endpoint, vin, recoveryContext) {
+    const pathname = new URL(endpoint.url).pathname;
+    try {
+      const data = await this.seatCupraOlaRequest("get", endpoint.url, {
+        vin,
+        recoveryContext,
+        returnFailureResult: true,
+      });
+      if (data && data.__seatCupraEndpointFailure) {
+        return {
+          ok: false,
+          path: endpoint.path,
+          pathname,
+          status: data.status,
+          code: data.code,
+          message: data.message,
+          category: data.category,
+        };
+      }
+      if (data == null) {
+        return {
+          ok: false,
+          path: endpoint.path,
+          pathname,
+          status: "skipped",
+          code: "skipped",
+          message: "",
+          category: "skipped",
+        };
+      }
+      return { ok: true, path: endpoint.path, pathname, data, options: endpoint.options || {} };
+    } catch (error) {
+      const status = error.response && error.response.status || "network_error";
+      const details = getSeatCupraOlaErrorDetails(error.response && error.response.data);
+      await this.recordSeatCupraSkippedEndpoint("get", pathname, status, error.response && error.response.data);
+      return {
+        ok: false,
+        path: endpoint.path,
+        pathname,
+        status,
+        code: details.code,
+        message: redactSecrets(details.message || error.message || error).slice(0, 300),
+        category: status === 400 || status === 404 ? "unsupported" : "request",
+      };
+    }
+  }
+
   async getSeatCupraStatus(
     vin,
     recoveryContext = { recoveryAttempted: false, stopDetailPolling: false, failureLogged: false },
   ) {
-    const endpoints = getSeatCupraDefaultStatusEndpoints(this.seatcupraUser, vin);
-
-    for (const endpoint of endpoints) {
-      if (this.seatCupraPollingStopped || recoveryContext.stopDetailPolling) return;
+    const endpoints = getSeatCupraDefaultStatusEndpoints(this.seatcupraUser, vin).filter((endpoint) => {
       if (this.ignoredPaths[vin] && this.ignoredPaths[vin].includes(endpoint.path)) {
         this.log.debug("Ignored path: " + endpoint.path);
+        return false;
+      }
+      const endpointKey = getSeatCupraSkippedEndpointKey("get", new URL(endpoint.url).pathname);
+      return !this.seatCupraSkippedEndpoints.has(endpointKey);
+    });
+    const results = await pollSeatCupraEndpoints(
+      endpoints,
+      (endpoint) => this.getSeatCupraEndpointResult(endpoint, vin, recoveryContext),
+      () => this.seatCupraPollingStopped || recoveryContext.stopDetailPolling,
+    );
+
+    for (const result of results) {
+      if (!isSeatCupraEndpointResultOk(result)) {
+        if (result.category === "unsupported") {
+          this.log.info("Vehicle is not supporting: " + result.path);
+          if (!this.ignoredPaths[vin]) this.ignoredPaths[vin] = [];
+          this.ignoredPaths[vin].push(result.path);
+        } else if (result.category !== "mycar" && result.category !== "optional") {
+          this.log.error(
+            `SEAT/CUPRA status request failed for ${result.path}: ` +
+              `status=${result.status} code=${redactSecrets(result.code).slice(0, 100)}`,
+          );
+        }
         continue;
       }
 
-      const endpointPathname = new URL(endpoint.url).pathname;
-      const endpointKey = getSeatCupraSkippedEndpointKey("get", endpointPathname);
-      if (this.seatCupraSkippedEndpoints.has(endpointKey)) continue;
-      await this.seatCupraOlaRequest("get", endpoint.url, { vin, recoveryContext })
-        .then(async (responseData) => {
-          if (responseData == null) return;
-          this.log.debug("Received data for " + endpoint.path);
-          this.log.debug(JSON.stringify(responseData));
-          if (endpoint.path === "mileage") {
-            if (responseData && responseData.mileageKm && responseData.mileageKm === 0) {
-              return;
-            }
-          }
-          const options = endpoint.options || {};
-          this.json2iob.parse(vin + "." + endpoint.path, responseData, options);
-          if (this.config.rawJson) {
-            await this.extendObjectAsync(vin + "." + endpoint.path + "rawJson", {
-              type: "state",
-              common: {
-                name: vin + "." + endpoint.path + "rawJson",
-                role: "state",
-                type: "json",
-                write: false,
-                read: true,
-              },
-              native: {},
-            });
-            this.setState(vin + "." + endpoint.path + "rawJson", JSON.stringify(responseData), true);
-          }
-        })
-        .catch((error) => {
-          if (this.seatCupraPollingStopped || recoveryContext.stopDetailPolling) return;
-          if (error.response && (error.response.status === 400 || error.response.status === 404)) {
-            this.log.info("Vehicle is not supporting: " + endpoint.path);
-            if (!this.ignoredPaths[vin]) {
-              this.ignoredPaths[vin] = [];
-            }
-            this.ignoredPaths[vin].push(endpoint.path);
-            return;
-          }
-          this.log.error("SEAT/CUPRA status request failed for " + endpoint.path + ": " + redactSecrets(error.message || error));
+      const responseData = result.data;
+      this.log.debug("Received data for " + result.path);
+      this.log.debug(JSON.stringify(responseData));
+      if (result.path === "mileage" && responseData.mileageKm === 0) continue;
+      this.json2iob.parse(vin + "." + result.path, responseData, result.options);
+      if (this.config.rawJson) {
+        await this.extendObjectAsync(vin + "." + result.path + "rawJson", {
+          type: "state",
+          common: {
+            name: vin + "." + result.path + "rawJson",
+            role: "state",
+            type: "json",
+            write: false,
+            read: true,
+          },
+          native: {},
         });
+        await this.setStateAsync(vin + "." + result.path + "rawJson", JSON.stringify(responseData), true);
+      }
     }
+    return results;
   }
+
   setSeatCupraStatus(vin, action, state) {
     //eslint-disable-next-line
     return new Promise(async (resolve, reject) => {
