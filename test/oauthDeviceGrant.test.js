@@ -359,8 +359,10 @@ describe("SEAT/CUPRA fresh device recovery", () => {
 
   it("contains no native config writes in adapter token store or clear methods", () => {
     const source = require("fs").readFileSync(require("path").join(__dirname, "..", "main.js"), "utf8");
-    const start = source.indexOf("  async storeSeatCupraTokens(tokens) {");
+    const start = source.indexOf("  async storeSeatCupraTokens(");
     const end = source.indexOf("  async setSeatCupraDeviceApprovalStates", start);
+    expect(start).to.be.greaterThan(-1);
+    expect(end).to.be.greaterThan(start);
     const tokenMethods = source.slice(start, end);
     expect(tokenMethods).not.to.include("getForeignObjectAsync");
     expect(tokenMethods).not.to.include("setForeignObjectAsync");
