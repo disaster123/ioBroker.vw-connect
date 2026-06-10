@@ -24,6 +24,10 @@ const {
   createSeatCupraSkippedEndpointDetail,
   handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraOlaHeaders,
+  getSeatCupraDefaultStatusEndpoints,
+  formatSeatCupraOlaRequest,
+  requestSeatCupraWithServerRetry,
+  shouldRecoverSeatCupraAuthentication,
 } = require("../lib/seatCupra");
 
 function response(status, data) {
@@ -464,16 +468,101 @@ describe("SEAT/CUPRA optional OLA endpoints", () => {
   });
 });
 
-describe("SEAT/CUPRA OLA headers", () => {
-  for (const [type, brand] of [["seatcupra", "cupra"], ["seat", "seat"]]) {
-    it(`builds required ${brand} headers`, () => {
-      const headers = getSeatCupraOlaHeaders(type, "user-id", "access-token");
-      expect(headers["app-brand"]).to.equal(brand);
-      expect(headers["app-market"]).to.equal("android");
-      expect(headers.origin).to.equal("app");
-      expect(headers.Authorization).to.equal("Bearer access-token");
+describe("SEAT/CUPRA OLA request compatibility", () => {
+  it("builds effective CUPRA read headers", () => {
+    const headers = getSeatCupraOlaHeaders("seatcupra", "user-id", "access-token", "primary", "VIN");
+    expect(headers).to.deep.equal({
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer access-token",
+      "app-market": "android",
+      "app-brand": "cupra",
+      "app-version": "2.15.0",
+      origin: "app",
+      "User-Agent": "OLACupra/2.15.0 (Android 12; sdk_gphone64_x86_64; Google) Mobile",
     });
-  }
+  });
+
+  it("builds effective SEAT read headers", () => {
+    const headers = getSeatCupraOlaHeaders("seat", "user-id", "access-token", "primary", "VIN");
+    expect(headers).to.deep.equal({
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer access-token",
+      "app-market": "android",
+      "app-brand": "seat",
+      "app-version": "2.17.0",
+      origin: "app",
+      "User-Agent": "OLASeat/2.13.3 (Android 12; sdk_gphone64_x86_64; Google) Mobile",
+    });
+  });
+
+  it("does not include user, VIN, or language headers in normal reads", () => {
+    const headers = getSeatCupraOlaHeaders("seatcupra", "user-id", "access-token", "primary", "VIN");
+    expect(headers).not.to.have.property("User-ID");
+    expect(headers).not.to.have.property("VIN");
+    expect(headers).not.to.have.property("Accept-Language");
+  });
+
+  it("uses only the reference-compatible default status endpoints", () => {
+    const endpoints = getSeatCupraDefaultStatusEndpoints("user-id", "VIN");
+    const paths = endpoints.map(({ url }) => new URL(url).pathname);
+    expect(paths).to.deep.equal([
+      "/v5/users/user-id/vehicles/VIN/mycar",
+      "/v1/vehicles/VIN/parkingposition",
+      "/v1/vehicles/VIN/ranges",
+      "/v2/vehicles/VIN/status",
+      "/v1/vehicles/VIN/charging/status",
+      "/v1/vehicles/VIN/charging/info",
+      "/v1/vehicles/VIN/climatisation/status",
+      "/v1/vehicles/VIN/maintenance",
+      "/v1/vehicles/VIN/mileage",
+      "/v3/vehicles/VIN/warninglights",
+    ]);
+    expect(paths.some((path) => path.includes("climatisation/settings"))).to.equal(false);
+  });
+
+  it("formats a sanitized effective request shape", () => {
+    const headers = getSeatCupraOlaHeaders("seatcupra", "user-id", "secret-token");
+    const message = formatSeatCupraOlaRequest(
+      "get",
+      "https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/VIN/ranges?secret=value",
+      headers,
+    );
+    expect(message).to.equal(
+      "SEAT/CUPRA OLA request: GET /v1/vehicles/VIN/ranges brand=cupra appVersion=2.15.0 " +
+        'userAgent="OLACupra/2.15.0 (Android 12; sdk_gphone64_x86_64; Google) Mobile" auth=yes',
+    );
+    expect(message).not.to.include("secret-token");
+    expect(message).not.to.include("?secret=value");
+  });
+
+  it("retries retryable 5xx responses with 3s, 6s, and 12s delays", async () => {
+    const statuses = [500, 502, 503, 504];
+    const delays = [];
+    let requests = 0;
+    const result = await requestSeatCupraWithServerRetry({
+      request: async () => ({ status: statuses[requests++] }),
+      sleep: async (delay) => delays.push(delay),
+    });
+    expect(requests).to.equal(4);
+    expect(delays).to.deep.equal([3000, 6000, 12000]);
+    expect(result.status).to.equal(504);
+  });
+
+  it("returns a recovered server response without invoking device login", async () => {
+    const statuses = [500, 200];
+    let requests = 0;
+    const result = await requestSeatCupraWithServerRetry({
+      request: async () => ({ status: statuses[requests++] }),
+      sleep: async () => {},
+      onRetry: () => {},
+    });
+    expect(result.status).to.equal(200);
+    expect(requests).to.equal(2);
+    expect(shouldRecoverSeatCupraAuthentication(500, { code: "missing-device-token" })).to.equal(false);
+    expect(shouldRecoverSeatCupraAuthentication(403, { code: "missing-device-token" })).to.equal(true);
+  });
 });
 
 describe("secret redaction", () => {

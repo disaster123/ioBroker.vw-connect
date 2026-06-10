@@ -36,7 +36,11 @@ const {
   handleSeatCupraRepeatedMissingDeviceToken,
   getSeatCupraBrandConfig,
   getSeatCupraOlaHeaders,
+  getSeatCupraDefaultStatusEndpoints,
+  formatSeatCupraOlaRequest,
+  requestSeatCupraWithServerRetry,
   isMissingDeviceToken,
+  shouldRecoverSeatCupraAuthentication,
 } = require("./lib/seatCupra");
 const { EuDataActClient, normalizeDataset: normalizeEuDataActDataset } = require("./lib/euDataAct");
 const tibber = require("./lib/tibber");
@@ -2898,15 +2902,30 @@ class VwWeconnect extends utils.Adapter {
     if (this.seatCupraSkippedEndpoints.has(endpointKey)) return null;
     for (const variant of ["primary", "fallback"]) {
       try {
-        response = await axios({
-          method,
-          url,
-          headers: {
-            ...getSeatCupraOlaHeaders(this.config.type, this.seatcupraUser, this.config.atoken, variant, vin),
-            ...extraHeaders,
-          },
-          data,
-          validateStatus: () => true,
+        const headers = {
+          ...getSeatCupraOlaHeaders(
+            this.config.type,
+            this.seatcupraUser,
+            this.config.atoken,
+            variant,
+            vin,
+            { includeIdentifiers: String(method).toLowerCase() !== "get" },
+          ),
+          ...extraHeaders,
+        };
+        response = await requestSeatCupraWithServerRetry({
+          request: () => axios({
+            method,
+            url,
+            headers,
+            data,
+            validateStatus: () => true,
+          }),
+          retryDelays: String(method).toLowerCase() === "get" ? undefined : [],
+          onAttempt: () => this.log.debug(formatSeatCupraOlaRequest(method, url, headers)),
+          onRetry: ({ attempt, delay, status }) => this.log.debug(
+            `SEAT/CUPRA OLA server error status=${status}; retry ${attempt}/3 in ${delay}ms: ${endpoint}`,
+          ),
         });
       } catch (error) {
         const safeMessage = redactSecrets(error && error.message ? error.message : "network request failed");
@@ -2917,7 +2936,7 @@ class VwWeconnect extends utils.Adapter {
       this.log.debug("SEAT/CUPRA OLA 403; retrying once with previous adapter OLA headers: " + endpoint);
     }
 
-    if (response && response.status === 403 && isMissingDeviceToken(response.data)) {
+    if (response && shouldRecoverSeatCupraAuthentication(response.status, response.data)) {
       if (disableMissingDeviceRecovery) {
         const error = new Error(`SEAT/CUPRA OLA missing-device-token: ${String(method).toUpperCase()} ${endpoint}`);
         error.response = response;
@@ -4779,71 +4798,8 @@ class VwWeconnect extends utils.Adapter {
     vin,
     recoveryContext = { recoveryAttempted: false, stopDetailPolling: false, failureLogged: false },
   ) {
-    const endpoints = [
-      {
-        url: `https://ola.prod.code.seat.cloud.vwgroup.com/v3/vehicles/${vin}/warninglights`,
-        path: "warninglights",
-        options: { forceIndex: true },
-      },
-      {
-        url: `https://ola.prod.code.seat.cloud.vwgroup.com/v5/users/${this.seatcupraUser}/vehicles/${vin}/mycar`,
-        path: "status",
-      },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/charging/status`, path: "charging" },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/charging/info`, path: "charging.info" },
-      {
-        url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/climatisation/status`,
-        path: "climatisation",
-      },
+    const endpoints = getSeatCupraDefaultStatusEndpoints(this.seatcupraUser, vin);
 
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/status`, path: "statusv2" },
-      {
-        url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/parkingposition`,
-        path: "parkingposition",
-      },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/mileage`, path: "mileage" },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/maintenance`, path: "maintenance" },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/ranges`, path: "ranges" },
-      {
-        url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/climatisation/settings`,
-        path: "climatisation.settings",
-      },
-
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/${vin}/measurements/engines`, path: "range" },
-      { url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/renders`, path: "renders" },
-      //https://ola.prod.code.seat.cloud.vwgroup.com/v1/vehicles/VSSZZZKM/driving-data/SHORT/last
-
-      //https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/VSSZZZKM/driving-data/WEEK?from=2024-01-01&to=2024-01-07&distanceUnit=km&speedUnit=kmph
-    ];
-
-    //check trip data every 60min
-    if (Date.now() - this.lastTripCheck > 1000 * 60 * 60) {
-      this.lastTripCheck = Date.now();
-      const tripDays = this.config.lastTripDays || 30;
-      const tripTo = new Date().toISOString();
-      const tripFrom = new Date(Date.now() - tripDays * 24 * 60 * 60 * 1000).toISOString();
-      const tripParams = `from=${tripFrom}&to=${tripTo}&distanceUnit=km&speedUnit=kmph`;
-      if (this.config.tripShortTerm == true) {
-        endpoints.push({
-          url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/driving-data/WEEK?${tripParams}`,
-          path: "tripShort",
-        });
-      }
-      if (this.config.tripLongTerm == true) {
-        endpoints.push({
-          url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/driving-data/MONTH?${tripParams}`,
-          path: "tripLong",
-        });
-      }
-      if (this.config.tripCyclic == true) {
-        endpoints.push({
-          url: `https://ola.prod.code.seat.cloud.vwgroup.com/v2/vehicles/${vin}/driving-data/CUSTOM?${tripParams}`,
-          path: "tripCyclic",
-        });
-      }
-    } else {
-      this.log.debug("Skip trip check because of last check was less than 60min ago");
-    }
     for (const endpoint of endpoints) {
       if (this.seatCupraPollingStopped || recoveryContext.stopDetailPolling) return;
       if (this.ignoredPaths[vin] && this.ignoredPaths[vin].includes(endpoint.path)) {
@@ -4854,7 +4810,6 @@ class VwWeconnect extends utils.Adapter {
       const endpointPathname = new URL(endpoint.url).pathname;
       const endpointKey = getSeatCupraSkippedEndpointKey("get", endpointPathname);
       if (this.seatCupraSkippedEndpoints.has(endpointKey)) continue;
-      this.log.debug("SEAT/CUPRA OLA request: GET " + endpointPathname);
       await this.seatCupraOlaRequest("get", endpoint.url, { vin, recoveryContext })
         .then(async (responseData) => {
           if (responseData == null) return;
@@ -4866,19 +4821,6 @@ class VwWeconnect extends utils.Adapter {
             }
           }
           const options = endpoint.options || {};
-          if (endpoint.path === "tripLong" || endpoint.path === "tripCyclic") {
-            //reverse data array by tripId
-            if (!Array.isArray(responseData.data)) {
-              return;
-            }
-            responseData.data.sort((a, b) => {
-              return b.tripId - a.tripId;
-            });
-            options.forceIndex = true;
-            if (this.config.numberOfTrips > 0) {
-              responseData.data = responseData.data.slice(0, this.config.numberOfTrips);
-            }
-          }
           this.json2iob.parse(vin + "." + endpoint.path, responseData, options);
           if (this.config.rawJson) {
             await this.extendObjectAsync(vin + "." + endpoint.path + "rawJson", {
