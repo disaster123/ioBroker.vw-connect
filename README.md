@@ -82,6 +82,12 @@ Object tree per VIN once the EU Data Act side is active:
 - **Stale values**: the portal merges several report snapshots into one flat array per dataset. Where the same field appears multiple times with different values, the adapter deterministically picks the entry with the smallest UUID (stable across refreshes — same approach as the Home Assistant integration).
 - **Reference implementation** (Home Assistant, Python): <https://github.com/mikrohard/hass-vw-eu-data-act>
 
+## My CUPRA / My SEAT classic OLA login
+
+My CUPRA and My SEAT use the classic IDK OAuth authorization-code flow with PKCE at `identity.vwgroup.io` for the existing OLA vehicle and status APIs. This matches the normal SEAT/CUPRA authentication strategy used by [`its-me-prash/vwgroup-connect-ha`](https://github.com/its-me-prash/vwgroup-connect-ha). Tokens remain in memory so authentication does not modify the adapter's native configuration at runtime.
+
+The default `seatCupraAuthStrategy` remains `classic_idk`. For diagnostics, set it to `hybrid_full` to use the callback `access_token` from the hybrid `code id_token token` response, or to `device_grant` to use Device Authorization Grant. These strategies keep tokens in memory and do **not** route CUPRA or SEAT through the EU Data Act portal. EU Data Act support remains optional and unchanged.
+
 ## Usage
 
 Use the state under remote control to control your car remotely.
@@ -105,6 +111,7 @@ You can set climatisaton temperature in
 ```
 ### 0.9.4 (2026-06-06)
 - add tibber support
+- use classic IDK PKCE authentication for My CUPRA / My SEAT classic OLA access; Device Grant remains an explicit diagnostic option
 
 ### 0.9.3 (2026-05-31)
 - improve eudata fetching
