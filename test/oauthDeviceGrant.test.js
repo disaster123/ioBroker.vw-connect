@@ -3,7 +3,12 @@
 
 const { expect } = require("chai");
 const { OAuthDeviceGrant, redactSecrets } = require("../lib/oauthDeviceGrant");
-const { getSeatCupraOlaHeaders } = require("../lib/seatCupra");
+const {
+  decodeBase64UrlJson,
+  resolveSeatCupraUserId,
+  getSeatCupraGarageUrl,
+  getSeatCupraOlaHeaders,
+} = require("../lib/seatCupra");
 
 function response(status, data) {
   return { status, data };
@@ -69,6 +74,32 @@ describe("OAuthDeviceGrant", () => {
     expect(sleeps).to.deep.equal([2000, 7000]);
   });
 
+  it("requires access_token but allows refresh_token to be absent", async () => {
+    const debugMessages = [];
+    const grant = new OAuthDeviceGrant({
+      clientId: "client-id",
+      scope: "openid",
+      httpClient: async () => response(200, { access_token: "access" }),
+      sleep: async () => {},
+      logger: { debug: (message) => debugMessages.push(message) },
+    });
+    const tokens = await grant.pollForTokens("device-code", { interval: 1, expiresIn: 30 });
+    expect(tokens.access_token).to.equal("access");
+    expect(tokens.refresh_token).to.equal(undefined);
+    expect(debugMessages[0]).to.include("refresh token present: false");
+  });
+
+  it("rejects a successful token response without access_token", async () => {
+    const grant = new OAuthDeviceGrant({
+      clientId: "client-id",
+      scope: "openid",
+      httpClient: async () => response(200, { refresh_token: "refresh" }),
+      sleep: async () => {},
+    });
+    await expect(grant.pollForTokens("device-code", { interval: 1, expiresIn: 30 }))
+      .to.be.rejectedWith("did not include access_token");
+  });
+
   it("uses refresh_token grant and accepts a rotated refresh token", async () => {
     let request;
     const grant = new OAuthDeviceGrant({
@@ -88,6 +119,64 @@ describe("OAuthDeviceGrant", () => {
   });
 });
 
+
+describe("SEAT/CUPRA user id resolution", () => {
+  function jwt(payload) {
+    const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    return `${encode({ alg: "none" })}.${encode(payload)}.signature`;
+  }
+
+  it("decodes base64url JWT JSON and extracts sub before HTTP fallbacks", async () => {
+    const token = jwt({ sub: "jwt-user" });
+    expect(decodeBase64UrlJson(token.split(".")[1]).sub).to.equal("jwt-user");
+    let httpCalls = 0;
+    const userId = await resolveSeatCupraUserId({
+      idToken: token,
+      identityUserInfo: async () => { httpCalls++; return { sub: "identity-user" }; },
+      olaUsers: async () => { httpCalls++; return { userId: "ola-user" }; },
+    });
+    expect(userId).to.equal("jwt-user");
+    expect(httpCalls).to.equal(0);
+  });
+
+  it("falls back to identity-userinfo", async () => {
+    let olaCalls = 0;
+    const userId = await resolveSeatCupraUserId({
+      idToken: "not-a-jwt",
+      identityUserInfo: async () => ({ sub: "identity-user" }),
+      olaUsers: async () => { olaCalls++; return { userId: "ola-user" }; },
+    });
+    expect(userId).to.equal("identity-user");
+    expect(olaCalls).to.equal(0);
+  });
+
+  it("falls back to OLA /v1/users", async () => {
+    const userId = await resolveSeatCupraUserId({
+      identityUserInfo: async () => { throw new Error("userinfo unavailable"); },
+      olaUsers: async () => ({ userId: "ola-user" }),
+    });
+    expect(userId).to.equal("ola-user");
+  });
+
+  it("throws one clear error after all user id sources fail", async () => {
+    await expect(resolveSeatCupraUserId({
+      idToken: "invalid",
+      identityUserInfo: async () => { throw new Error("userinfo unavailable"); },
+      olaUsers: async () => ({}),
+    })).to.be.rejectedWith("SEAT/CUPRA user id could not be resolved");
+  });
+
+  it("prevents a garage request when seatcupraUser is undefined", () => {
+    let requestCalled = false;
+    expect(() => {
+      const url = getSeatCupraGarageUrl(undefined);
+      requestCalled = true;
+      return url;
+    }).to.throw("SEAT/CUPRA user id could not be resolved");
+    expect(requestCalled).to.equal(false);
+  });
+});
+
 describe("SEAT/CUPRA OLA headers", () => {
   for (const [type, brand] of [["seatcupra", "cupra"], ["seat", "seat"]]) {
     it(`builds required ${brand} headers`, () => {
@@ -101,9 +190,14 @@ describe("SEAT/CUPRA OLA headers", () => {
 });
 
 describe("secret redaction", () => {
-  it("removes bearer tokens and JWTs", () => {
+  it("removes bearer tokens, JWTs, and OAuth token fields", () => {
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature";
-    const redacted = redactSecrets(`Authorization: Bearer ${jwt} access_token=${jwt}`);
+    const redacted = redactSecrets(
+      `Authorization: Bearer bearer-secret access_token=access-secret refresh_token=refresh-secret id_token=${jwt}`,
+    );
+    expect(redacted).not.to.include("bearer-secret");
+    expect(redacted).not.to.include("access-secret");
+    expect(redacted).not.to.include("refresh-secret");
     expect(redacted).not.to.include(jwt);
     expect(redacted).to.include("Bearer [REDACTED]");
   });

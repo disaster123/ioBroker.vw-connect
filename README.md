@@ -84,7 +84,7 @@ Object tree per VIN once the EU Data Act side is active:
 
 ## My CUPRA / My SEAT classic OLA login
 
-My CUPRA and My SEAT now use the OAuth Device Authorization Grant at `identity.vwgroup.io` for the existing classic OLA vehicle and status APIs. On the first start after updating, the adapter tries to confirm the browser/device login with the configured username and password. If automatic confirmation is blocked by MFA, captcha, or an identity-provider change, open the URL shown in the adapter log or in `info.seatCupraDeviceVerificationUrl` and confirm `info.seatCupraDeviceUserCode` before `info.seatCupraDeviceLoginExpires`.
+My CUPRA and My SEAT now use the OAuth Device Authorization Grant at `identity.vwgroup.io` for the existing classic OLA vehicle and status APIs. On the first start after updating, the adapter tries to confirm the browser/device login with the configured username and password. If automatic confirmation is blocked by MFA, captcha, or an identity-provider change, open `info.seatCupraDeviceVerificationUrl` and confirm `info.seatCupraDeviceUserCode` before `info.seatCupraDeviceLoginExpires`.
 
 This repair does **not** route CUPRA or SEAT through the EU Data Act portal. EU Data Act support remains optional and unchanged; it is not required for classic OLA polling. The implementation is a clean JavaScript RFC 8628 implementation informed by the behavior documented in [`its-me-prash/vwgroup-connect-ha`](https://github.com/its-me-prash/vwgroup-connect-ha) and the adapter's existing Audi device flow.
 
