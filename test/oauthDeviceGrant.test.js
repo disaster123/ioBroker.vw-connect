@@ -5,6 +5,7 @@ const { expect } = require("chai");
 const { OAuthDeviceGrant, redactSecrets } = require("../lib/oauthDeviceGrant");
 const {
   decodeBase64UrlJson,
+  decodeJwtPayload,
   resolveSeatCupraUserId,
   getSeatCupraGarageUrl,
   clearSeatCupraTokenValues,
@@ -13,6 +14,8 @@ const {
   startSeatCupraDeviceAuthorization,
   shouldUseSeatCupraRefreshToken,
   beginSeatCupraMissingDeviceRecovery,
+  completeSeatCupraMissingDeviceRecovery,
+  failSeatCupraMissingDeviceRecovery,
   formatSeatCupraOlaFailure,
   getSeatCupraOlaHeaders,
 } = require("../lib/seatCupra");
@@ -136,6 +139,7 @@ describe("SEAT/CUPRA user id resolution", () => {
   it("decodes base64url JWT JSON and extracts sub before HTTP fallbacks", async () => {
     const token = jwt({ sub: "jwt-user" });
     expect(decodeBase64UrlJson(token.split(".")[1]).sub).to.equal("jwt-user");
+    expect(decodeJwtPayload(token).sub).to.equal("jwt-user");
     let httpCalls = 0;
     const userId = await resolveSeatCupraUserId({
       idToken: token,
@@ -186,7 +190,7 @@ describe("SEAT/CUPRA user id resolution", () => {
 
 
 describe("SEAT/CUPRA fresh device recovery", () => {
-  it("bypasses refresh_token when forceFreshDeviceLogin is enabled", () => {
+  it("does not use a stale refresh token when force is true", () => {
     expect(shouldUseSeatCupraRefreshToken(false, "stale-refresh")).to.equal(true);
     expect(shouldUseSeatCupraRefreshToken(true, "stale-refresh")).to.equal(false);
   });
@@ -214,7 +218,7 @@ describe("SEAT/CUPRA fresh device recovery", () => {
   it("clears stale tokens before requesting fresh device authorization", async () => {
     const events = [];
     const device = await startSeatCupraDeviceAuthorization({
-      forceFreshDeviceLogin: true,
+      force: true,
       clearTokens: async () => events.push("clear"),
       requestDeviceCode: async () => { events.push("request"); return { device_code: "new" }; },
     });
@@ -222,14 +226,14 @@ describe("SEAT/CUPRA fresh device recovery", () => {
     expect(device.device_code).to.equal("new");
   });
 
-  it("requests forceFreshDeviceLogin and resolves the user before retry", async () => {
+  it("requests force=true and resolves the user before retry", async () => {
     const events = [];
     await runSeatCupraFreshRecovery({
       login: async (options) => events.push(["login", options]),
       resolveUserId: async () => events.push(["resolve"]),
     });
     expect(events).to.deep.equal([
-      ["login", { forceFreshDeviceLogin: true }],
+      ["login", { force: true }],
       ["resolve"],
     ]);
   });
@@ -251,6 +255,43 @@ describe("SEAT/CUPRA fresh device recovery", () => {
     expect(beginSeatCupraMissingDeviceRecovery(false, context)).to.equal(true);
     expect(beginSeatCupraMissingDeviceRecovery(true, context)).to.equal(false);
     expect(context.skipRemaining).to.equal(true);
+  });
+
+  it("resets recovery flags after a successful retry", () => {
+    const state = {
+      seatCupraForcedReloginAttempted: true,
+      seatCupraMissingDeviceWarningLogged: true,
+      seatCupraPollingStopped: false,
+    };
+    completeSeatCupraMissingDeviceRecovery(state);
+    expect(state.seatCupraForcedReloginAttempted).to.equal(false);
+    expect(state.seatCupraMissingDeviceWarningLogged).to.equal(false);
+    expect(state.seatCupraPollingStopped).to.equal(false);
+  });
+
+  it("leaves tokens cleared and polling stopped after fresh login fails", async () => {
+    const state = {
+      atoken: "old-access",
+      rtoken: "old-refresh",
+      idtoken: "old-id",
+      seatCupraIdToken: "old-seat-id",
+      seatCupraTokenExpiresAt: 123,
+      seatCupraPollingStopped: false,
+    };
+    try {
+      await startSeatCupraDeviceAuthorization({
+        force: true,
+        clearTokens: async () => clearSeatCupraTokenValues(state),
+        requestDeviceCode: async () => { throw new Error("device authorization failed"); },
+      });
+    } catch {
+      failSeatCupraMissingDeviceRecovery(state);
+    }
+    expect(state.atoken).to.equal("");
+    expect(state.rtoken).to.equal("");
+    expect(state.idtoken).to.equal("");
+    expect(state.seatCupraIdToken).to.equal("");
+    expect(state.seatCupraPollingStopped).to.equal(true);
   });
 
   it("formats OLA failures with pathname and status without secrets", () => {
@@ -287,15 +328,17 @@ describe("SEAT/CUPRA OLA headers", () => {
 });
 
 describe("secret redaction", () => {
-  it("removes bearer tokens, JWTs, and OAuth token fields", () => {
+  it("removes Bearer, JWT, access, refresh, ID, and device-code secrets", () => {
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature";
     const redacted = redactSecrets(
-      `Authorization: Bearer bearer-secret access_token=access-secret refresh_token=refresh-secret id_token=${jwt}`,
+      `Authorization: Bearer bearer-secret access_token=access-secret refresh_token=refresh-secret ` +
+        `id_token=${jwt} device_code=device-secret`,
     );
     expect(redacted).not.to.include("bearer-secret");
     expect(redacted).not.to.include("access-secret");
     expect(redacted).not.to.include("refresh-secret");
     expect(redacted).not.to.include(jwt);
+    expect(redacted).not.to.include("device-secret");
     expect(redacted).to.include("Bearer [REDACTED]");
   });
 });
