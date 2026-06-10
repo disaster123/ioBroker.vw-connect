@@ -233,7 +233,8 @@
     "tibberClientId": "",
     "tibberClientSecret": "",
     "tibberCode": "",
-    "tibberInterval": 5
+    "tibberInterval": 5,
+    "seatCupraAuthStrategy": "classic_idk"
   },
   "objects": [],
   "instanceObjects": [

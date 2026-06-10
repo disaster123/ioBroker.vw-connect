@@ -86,7 +86,7 @@ Object tree per VIN once the EU Data Act side is active:
 
 My CUPRA and My SEAT use the classic IDK OAuth authorization-code flow with PKCE at `identity.vwgroup.io` for the existing OLA vehicle and status APIs. This matches the normal SEAT/CUPRA authentication strategy used by [`its-me-prash/vwgroup-connect-ha`](https://github.com/its-me-prash/vwgroup-connect-ha). Tokens remain in memory so authentication does not modify the adapter's native configuration at runtime.
 
-Device Authorization Grant remains available only as an explicit diagnostic option by setting `seatCupraAuthStrategy` to `device_grant`; the default is `classic_idk`. This change does **not** route CUPRA or SEAT through the EU Data Act portal. EU Data Act support remains optional and unchanged.
+The default `seatCupraAuthStrategy` remains `classic_idk`. For diagnostics, set it to `hybrid_full` to use the callback `access_token` from the hybrid `code id_token token` response, or to `device_grant` to use Device Authorization Grant. These strategies keep tokens in memory and do **not** route CUPRA or SEAT through the EU Data Act portal. EU Data Act support remains optional and unchanged.
 
 ## Usage
 

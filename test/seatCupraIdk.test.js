@@ -16,6 +16,7 @@ const {
   decodeJwtMetadataSafe,
   decodeJwtMetadata,
   upgradeSeatCupraClassicTokens,
+  extractSeatCupraHybridCallbackTokens,
 } = require("../lib/seatCupraIdk");
 const { getSeatCupraBrandConfig, getSeatCupraOlaHeaders } = require("../lib/seatCupra");
 
@@ -51,10 +52,11 @@ function createAuth(type, request, logger = {}) {
 }
 
 describe("SEAT/CUPRA classic IDK PKCE", () => {
-  it("uses classic_idk by default and Device Grant only when explicitly selected", () => {
+  it("uses classic_idk by default and enables diagnostic strategies only when explicitly selected", () => {
     expect(getSeatCupraAuthStrategy()).to.equal("classic_idk");
     expect(getSeatCupraAuthStrategy("unknown")).to.equal("classic_idk");
     expect(getSeatCupraAuthStrategy("classic_idk")).to.equal("classic_idk");
+    expect(getSeatCupraAuthStrategy("hybrid_full")).to.equal("hybrid_full");
     expect(getSeatCupraAuthStrategy("device_grant")).to.equal("device_grant");
   });
 
@@ -70,6 +72,66 @@ describe("SEAT/CUPRA classic IDK PKCE", () => {
     expect(url.searchParams.get("code_challenge_method")).to.equal("S256");
     expect(url.searchParams.get("code_challenge")).to.equal(pkce.codeChallenge);
     expect(url.searchParams.get("prompt")).to.equal("login");
+  });
+
+  it("builds the hybrid_full PKCE authorize URL", () => {
+    const brand = getSeatCupraBrandConfig("seatcupra");
+    const pkce = createSeatCupraPkce();
+    const url = new URL(buildSeatCupraAuthorizeUrl(brand, pkce, { hybridFull: true }));
+    expect(url.searchParams.get("response_type")).to.equal("code id_token token");
+    expect(url.searchParams.get("redirect_uri")).to.equal(brand.redirectUri);
+    expect(url.searchParams.get("state")).to.equal(pkce.state);
+    expect(url.searchParams.get("nonce")).to.equal(pkce.nonce);
+    expect(url.searchParams.get("code_challenge")).to.equal(pkce.codeChallenge);
+    expect(url.searchParams.get("code_challenge_method")).to.equal("S256");
+  });
+
+  it("extracts hybrid callback tokens from fragment and query callbacks", () => {
+    const fragment = extractSeatCupraHybridCallbackTokens(
+      "cupra://oauth-callback#access_token=fragment-access&id_token=fragment-id&code=fragment-code&expires_in=3600&state=expected",
+      "cupra://oauth-callback",
+      "expected",
+    );
+    expect(fragment).to.include({
+      access_token: "fragment-access",
+      id_token: "fragment-id",
+      code: "fragment-code",
+      expires_in: 3600,
+    });
+    const query = extractSeatCupraHybridCallbackTokens(
+      "cupra://oauth-callback?access_token=query-access&id_token=query-id&code=query-code&state=expected",
+      "cupra://oauth-callback",
+      "expected",
+    );
+    expect(query).to.include({
+      access_token: "query-access",
+      id_token: "query-id",
+      code: "query-code",
+      expires_in: 7200,
+    });
+    const pathStyle = extractSeatCupraHybridCallbackTokens(
+      "cupra://oauth-callback/access_token=path-access&id_token=path-id&code=path-code&state=expected",
+      "cupra://oauth-callback",
+      "expected",
+    );
+    expect(pathStyle).to.include({
+      access_token: "path-access",
+      id_token: "path-id",
+      code: "path-code",
+    });
+  });
+
+  it("rejects hybrid callback state mismatches and missing callback tokens", () => {
+    expect(() => extractSeatCupraHybridCallbackTokens(
+      "cupra://oauth-callback#access_token=access&id_token=id&state=wrong",
+      "cupra://oauth-callback",
+      "expected",
+    )).to.throw("SEAT/CUPRA hybrid_full callback state mismatch");
+    expect(() => extractSeatCupraHybridCallbackTokens(
+      "cupra://oauth-callback#code=code&state=expected",
+      "cupra://oauth-callback",
+      "expected",
+    )).to.throw("SEAT/CUPRA hybrid_full callback did not contain access_token/id_token");
   });
 
   it("splits CUPRA and SEAT exchange and refresh endpoints", () => {
@@ -174,6 +236,110 @@ describe("SEAT/CUPRA classic IDK PKCE", () => {
     expect(loginPost.headers.Origin).to.equal("https://identity.vwgroup.io");
     expect(loginPost.headers.Referer).to.include("/u/login");
     expect(loginPost.headers["Content-Type"]).to.equal("application/x-www-form-urlencoded");
+  });
+
+  it("keeps the hybrid callback access token while capturing an exchanged refresh token", async () => {
+    let oauthState;
+    const messages = [];
+    const request = createRequest((options) => {
+      const url = new URL(options.url);
+      if (url.pathname === "/oidc/v1/authorize") {
+        oauthState = url.searchParams.get("state");
+        expect(url.searchParams.get("response_type")).to.equal("code id_token token");
+        return { status: 302, headers: { location: "/u/login?state=auth0-state" } };
+      }
+      if (url.pathname === "/u/login" && options.method === "GET") {
+        return { body: '<form><input name="state" value="auth0-state"></form>' };
+      }
+      if (url.pathname === "/u/login" && options.method === "POST") {
+        return { status: 302, headers: { location: "/authorize/resume" } };
+      }
+      if (url.pathname === "/authorize/resume") {
+        return { body: '<form action="/login/callback"><input name="state" value="callback-state"></form>' };
+      }
+      if (url.pathname === "/login/callback") {
+        return {
+          status: 302,
+          headers: {
+            location: `cupra://oauth-callback#access_token=callback-access&id_token=callback-id&` +
+              `code=hybrid-code&expires_in=5400&state=${oauthState}`,
+          },
+        };
+      }
+      if (options.url === IDENTITY_TOKEN_URL) {
+        return {
+          body: JSON.stringify({
+            access_token: "exchange-access",
+            id_token: "exchange-id",
+            refresh_token: "exchange-refresh",
+          }),
+        };
+      }
+      throw new Error(`Unexpected hybrid request ${options.method || "GET"} ${url.pathname}`);
+    });
+    const auth = createAuth("seatcupra", request, {
+      info: (message) => messages.push(message),
+      debug: (message) => messages.push(message),
+    });
+    const tokens = await auth.authenticateHybridFull();
+    expect(tokens).to.deep.equal({
+      access_token: "callback-access",
+      id_token: "callback-id",
+      refresh_token: "exchange-refresh",
+      expires_in: 5400,
+      token_type: "Bearer",
+    });
+    expect(messages).to.include("SEAT/CUPRA hybrid_full code exchange captured refresh_token");
+    const output = messages.join("\n");
+    for (const secret of [
+      "callback-access", "callback-id", "exchange-access", "exchange-id", "exchange-refresh",
+      "hybrid-code", oauthState,
+    ]) expect(output).not.to.include(secret);
+  });
+
+  it("keeps the hybrid callback token when the opportunistic code exchange fails", async () => {
+    const messages = [];
+    const request = createRequest(() => {
+      throw new Error("network should not be used by the callback handler test");
+    });
+    const auth = createAuth("seatcupra", request, { debug: (message) => messages.push(message) });
+    auth.exchangeCode = async () => {
+      throw new Error("exchange unavailable");
+    };
+    auth.authenticateWithCallback = async ({ callbackHandler }) => callbackHandler(
+      "cupra://oauth-callback#access_token=callback-access&id_token=callback-id&code=callback-code&state=expected",
+      { state: "expected", codeVerifier: "verifier-secret" },
+    );
+    const tokens = await auth.authenticateHybridFull();
+    expect(tokens.access_token).to.equal("callback-access");
+    expect(tokens.id_token).to.equal("callback-id");
+    expect(tokens.refresh_token).to.equal("");
+    expect(messages).to.deep.equal([
+      "SEAT/CUPRA hybrid_full code exchange unavailable; using callback token",
+    ]);
+    const output = messages.join("\n");
+    for (const secret of [
+      "callback-access", "callback-id", "callback-code", "verifier-secret", "cupra://oauth-callback",
+    ]) expect(output).not.to.include(secret);
+  });
+
+  it("accepts a hybrid callback without a code or refresh token", async () => {
+    const request = createRequest(() => {
+      throw new Error("network should not be used by the callback handler test");
+    });
+    const auth = createAuth("seatcupra", request);
+    auth.authenticateWithCallback = async ({ hybridFull, callbackHandler }) => {
+      expect(hybridFull).to.equal(true);
+      return callbackHandler(
+        "cupra://oauth-callback#access_token=callback-access&id_token=callback-id&state=expected",
+        { state: "expected", codeVerifier: "verifier" },
+      );
+    };
+    const tokens = await auth.authenticateHybridFull();
+    expect(tokens.access_token).to.equal("callback-access");
+    expect(tokens.id_token).to.equal("callback-id");
+    expect(tokens.refresh_token).to.equal("");
+    expect(tokens.expires_in).to.equal(7200);
   });
 
   it("falls back to the legacy signin-service flow when /u/login is absent", async () => {
@@ -333,6 +499,31 @@ describe("SEAT/CUPRA classic IDK PKCE", () => {
     expect(loginMethod).to.include("upgradeSeatCupraClassicTokens(tokens");
     expect(loginMethod).to.include("auth.refresh(refreshToken)");
     expect(loginMethod).to.include("classic_idk_ola_refresh");
+  });
+
+  it("wires hybrid_full login without refreshing before the first detail polling cycle", () => {
+    const source = require("fs").readFileSync(require("path").join(__dirname, "..", "main.js"), "utf8");
+    const start = source.indexOf("  async loginSeatCupraHybridFull(");
+    const end = source.indexOf("  async loginSeatCupra(", start);
+    const loginMethod = source.slice(start, end);
+    expect(loginMethod).to.include("authenticateHybridFull()");
+    expect(loginMethod).to.include('"hybrid_full_callback_with_refresh_token"');
+    expect(loginMethod).to.include('"hybrid_full_callback"');
+    expect(loginMethod).not.to.include(".refresh(");
+    const routerStart = source.indexOf("  async loginSeatCupra(");
+    const routerEnd = source.indexOf("  async setSeatCupraDeviceApprovalStates", routerStart);
+    expect(source.slice(routerStart, routerEnd)).to.include('strategy === "hybrid_full"');
+    const refreshStart = source.indexOf("  async refreshSeatCupraToken(");
+    const refreshEnd = source.indexOf("  getVehicleData(", refreshStart);
+    const refreshMethod = source.slice(refreshStart, refreshEnd);
+    expect(refreshMethod).to.include('this.seatCupraTokenStrategy === "hybrid_full"');
+    expect(refreshMethod).to.include('"hybrid_full_refresh"');
+    expect(refreshMethod).to.include("loginSeatCupraHybridFull({ force: true })");
+  });
+
+  it("keeps hybrid_full recovery on hybrid_full and does not fall back to classic IDK", () => {
+    expect(getSeatCupraMissingDeviceRecoveryStrategy("hybrid_full", "hybrid_full")).to.equal("hybrid_full");
+    expect(getSeatCupraMissingDeviceRecoveryStrategy("classic_idk", "hybrid_full")).to.equal("hybrid_full");
   });
 
   it("switches Device Grant missing-device-token recovery to classic IDK", () => {
