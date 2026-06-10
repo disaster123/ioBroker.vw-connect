@@ -319,9 +319,9 @@ class VwWeconnect extends utils.Adapter {
     //
     // Map adapter type -> EU Data Act brand key. For types where the user's
     // VW-Group account is the same one that authenticates the brand-specific
-    // app, the portal accepts those credentials. Audi/Skoda/Cupra/Seat are
-    // OPTIONAL just like the VW path: the legacy brand login below remains
-    // the primary source.
+    // app, the portal accepts those credentials. Audi/Skoda/Seat keep their
+    // legacy brand login below. CUPRA uses this portal as its only data source
+    // because its legacy OLA detail API rejects requests without a device token.
     const euDataActBrand = {
       id: "VOLKSWAGEN_PASSENGER_CARS",
       audietron: "AUDI",
@@ -331,6 +331,7 @@ class VwWeconnect extends utils.Adapter {
       seatcupra: "CUPRA",
       seat: "SEAT",
     }[this.config.type];
+    const isEuDataActOnlyType = this.config.type === "id" || this.config.type === "seatcupra";
     if (euDataActBrand) {
       this.runEuDataAct(euDataActBrand).catch((err) => {
         const msg = (err && err.message) || String(err);
@@ -340,16 +341,14 @@ class VwWeconnect extends utils.Adapter {
             "log in once at https://eu-data-act.drivesomethinggreater.com/, link " +
             "your vehicle and configure a continuous 15-minute data request.",
         );
-        // Recovery for type=id: it's the only data source, so a transient
-        // failure (network blip, portal 5xx) shouldn't leave the adapter
-        // dead until a manual restart. Schedule a restart in 30 min.
-        // Credential / account errors (wrong password, account locked,
-        // not entitled) do NOT trigger restart — those don't self-heal,
-        // the user must fix the config.
-        if (this.config.type === "id") {
+        // EU Data Act-only types must recover from transient startup failures
+        // without falling back to an unavailable legacy API. Credential and
+        // account errors do not self-heal, so they require a manual correction.
+        if (isEuDataActOnlyType) {
+          const typeLabel = this.config.type === "seatcupra" ? "My CUPRA" : "VW ID";
           if (/login failed|password_invalid|email_invalid|account.*(locked|disabled)|not entitled/i.test(msg)) {
             this.log.error(
-              "VW ID: EU Data Act login refused. Adapter staying down until " +
+              `${typeLabel}: EU Data Act login refused. Adapter staying down until ` +
                 "credentials are corrected. Update user/password in the adapter " +
                 "settings, then restart manually.",
             );
@@ -357,7 +356,7 @@ class VwWeconnect extends utils.Adapter {
             return;
           }
           this.log.warn(
-            `VW ID: EU Data Act setup failed (${msg}). Will restart adapter in 30 min.`,
+            `${typeLabel}: EU Data Act setup failed (${msg}). Will restart adapter in 30 min.`,
           );
           this.restartTimeout && clearTimeout(this.restartTimeout);
           this.restartTimeout = setTimeout(() => {
@@ -366,8 +365,8 @@ class VwWeconnect extends utils.Adapter {
           }, 30 * 60 * 1000);
         }
       });
-      // For non-id brands we fall through to this.login() below; for
-      // type=id the early return after this block skips it entirely.
+      // Most brands fall through to this.login() below. The early returns
+      // for type=id and type=seatcupra skip their unavailable legacy APIs.
     }
 
     // Tibber Data API as an additional optional source. Triggered for ANY
@@ -396,6 +395,15 @@ class VwWeconnect extends utils.Adapter {
         "Classic VW ID login (a24fba63 OAuth client) was retired by VW. " +
           "The adapter now relies exclusively on the EU Data Act portal " +
           "for VW ID vehicles. See README -> 'EU Data Act portal' for setup.",
+      );
+      this.subscribeStates("*");
+      return;
+    }
+
+    if (this.config.type === "seatcupra") {
+      this.log.info(
+        "My CUPRA: legacy OLA detail API is blocked by missing-device-token. " +
+          "Using EU Data Act as the only data source.",
       );
       this.subscribeStates("*");
       return;
@@ -7016,6 +7024,8 @@ class VwWeconnect extends utils.Adapter {
     this.euDataActLastDataset = this.euDataActLastDataset || {};
     this.euDataActNoContentLogged = this.euDataActNoContentLogged || {};
     this.euDataActBackoffUntil = this.euDataActBackoffUntil || {};
+    this.euDataActDiagnostics = this.euDataActDiagnostics || {};
+    this.euDataActDownloadCooldowns = this.euDataActDownloadCooldowns || {};
     // Load json2iob enrichment maps once. Both files are derived from the
     // EU Data Act PDF data dictionary; descriptions are friendly names per
     // dataFieldName leaf, states are rawValue->label maps for enum fields.
@@ -7211,47 +7221,50 @@ class VwWeconnect extends utils.Adapter {
    * normalized values into `<vin>.statuseudata.*`. The raw payload is also
    * stored in `<vin>.statuseudata.rawJson` when `config.rawJson` is enabled.
    */
+  _maskVin(vin) {
+    return vin.length > 4 ? `${"*".repeat(Math.min(8, vin.length - 4))}${vin.slice(-4)}` : "****";
+  }
+
+  async _writeEuDataActDiagnostics(vin, updates) {
+    this.euDataActDiagnostics = this.euDataActDiagnostics || {};
+    const diagnostics = {
+      ...(this.euDataActDiagnostics[vin] || {}),
+      ...updates,
+    };
+    this.euDataActDiagnostics[vin] = diagnostics;
+    await this.json2iob.parse(vin + ".statuseudata.diagnostic", diagnostics, {
+      forceIndex: true,
+      channelName: "EU Data Act diagnostics",
+    });
+  }
+
   async getEuDataActStatus(vin) {
     if (!this.euDataAct) return;
-    // Per-VIN backoff: when the portal returns a 5xx (even after the lib's
-    // single re-login retry) we suspend polling for 15 min instead of
-    // hammering the same broken endpoint every minute. Clearing the entry
-    // on a successful list call resumes the normal cadence.
+    // Per-VIN backoff is reserved for metadata/list service failures. An
+    // individual ZIP download failure is handled below and retried next cycle.
     this.euDataActBackoffUntil = this.euDataActBackoffUntil || {};
     if (this.euDataActBackoffUntil[vin] && Date.now() < this.euDataActBackoffUntil[vin]) {
-      this.log.debug(
-        `EU Data Act: ${vin} in backoff until ${new Date(this.euDataActBackoffUntil[vin]).toISOString()}`,
-      );
+      this.log.debug(`EU Data Act: ${vin} in backoff until ${new Date(this.euDataActBackoffUntil[vin]).toISOString()}`);
       return;
     }
     this.euDataActLastDataset = this.euDataActLastDataset || {};
     this.euDataActNoContentLogged = this.euDataActNoContentLogged || {};
+    this.euDataActDiagnostics = this.euDataActDiagnostics || {};
+    this.euDataActDownloadCooldowns = this.euDataActDownloadCooldowns || {};
     try {
-      // Identifier lookup is inside the try so a 5xx during /metadata also
-      // routes through the catch and triggers the backoff. Other failures
-      // (no data request, generic) return null softly and short-circuit.
       const identifier = await this._ensureEuDataActIdentifier(vin);
       if (!identifier) return;
-      // Cheap step: just list. Listing is small (~few KB JSON) and the
-      // portal happily serves it every minute.
       const listStart = Date.now();
       const datasets = await this.euDataAct.listDatasets(vin, identifier);
-      // Successful list call -> portal is healthy again, clear any backoff.
       delete this.euDataActBackoffUntil[vin];
-      const contentDatasets = datasets.filter((d) => d && d.name && !d.name.endsWith("_no_content_found.zip"));
-      const newest = contentDatasets.sort(
-        (a, b) => String(b.createdOn || b.name).localeCompare(String(a.createdOn || a.name)),
-      )[0];
+      const contentDatasets = datasets
+        .filter((d) => d && d.name && !d.name.endsWith("_no_content_found.zip"))
+        .sort((a, b) => String(b.createdOn || b.name).localeCompare(String(a.createdOn || a.name)));
+      const newest = contentDatasets[0];
       this.log.debug(
         `EU Data Act: ${vin} listed ${datasets.length} datasets ` +
           `(${contentDatasets.length} with content) in ${Date.now() - listStart}ms`,
       );
-      // Mixed-case detection: real datasets exist but the most recent
-      // sampling slots produced no_content. Count the consecutive trailing
-      // no_content entries (newest-first) before the first real one. >=2
-      // means the car has missed at least the last two 15-min slots after
-      // delivering data — enough to mention without flapping on a single
-      // skipped slot.
       const sortedDesc = datasets
         .filter((d) => d && d.name)
         .slice()
@@ -7270,8 +7283,6 @@ class VwWeconnect extends utils.Adapter {
         );
       }
       if (!newest) {
-        // Two distinct sub-cases worth telling the user about. Logged once
-        // per VIN per session — the 1-min poll loop would otherwise spam.
         if (datasets.length === 0) {
           this.log.debug(`EU Data Act: ${vin} portal listing is empty (data request just activated?)`);
         } else if (!this.euDataActNoContentLogged[vin]) {
@@ -7288,35 +7299,112 @@ class VwWeconnect extends utils.Adapter {
         return;
       }
       if (this.euDataActLastDataset[vin] === newest.name) {
-        // Nothing new since last cycle — skip the download. With 1-minute
-        // listing polling and 15-minute portal cadence we'll typically log
-        // this 14 times in a row, then download once.
         this.log.debug(`EU Data Act: ${vin} no new dataset (${newest.name})`);
         return;
       }
-      const downloadStart = Date.now();
-      const dl = await this.euDataAct.downloadDataset(vin, identifier, newest.name);
-      const normalized = normalizeEuDataActDataset(dl.json);
-      const dataPoints = (dl.json.Data || []).length;
+
+      const diagnostics = {
+        lastFileListCount: datasets.length,
+        lastAttemptedFile: newest.name,
+        lastError: "",
+      };
+      const cooldowns = (this.euDataActDownloadCooldowns[vin] = this.euDataActDownloadCooldowns[vin] || {});
+      const now = Date.now();
+      const cooldownMs = 10 * 60 * 1000;
+      let attemptedFiles = 0;
+      let selected = null;
+      let selectedDataset = null;
+      let lastDownload = null;
+
+      for (const candidate of contentDatasets) {
+        if (attemptedFiles >= 5) break;
+        const cooldownUntil = cooldowns[candidate.name] || 0;
+        if (cooldownUntil > now) {
+          this.log.debug(
+            `EU Data Act: skipping cooling dataset vin=${this._maskVin(vin)} ` +
+              `filename=${candidate.name} until=${new Date(cooldownUntil).toISOString()}`,
+          );
+          continue;
+        }
+        if (cooldownUntil) delete cooldowns[candidate.name];
+
+        // Once the scan reaches the last successful file, everything after it
+        // is older and must not be downloaded again merely as a fallback.
+        if (candidate.name === this.euDataActLastDataset[vin]) break;
+
+        attemptedFiles++;
+        const downloadStart = Date.now();
+        let dl;
+        try {
+          dl = await this.euDataAct.downloadDataset(vin, identifier, candidate.name);
+        } catch (err) {
+          const message = (err && err.message) || "dataset download failed";
+          if (/HTTP (?:401|403)/.test(message)) throw err;
+          diagnostics.lastError = message;
+          cooldowns[candidate.name] = now + cooldownMs;
+          lastDownload = { status: 0, contentType: "", byteSize: 0 };
+          this.log.debug(
+            `EU Data Act: dataset download failed vin=${this._maskVin(vin)} ` +
+              `filename=${candidate.name}: ${message}`,
+          );
+          continue;
+        }
+        lastDownload = dl;
+        if (attemptedFiles === 1) {
+          diagnostics.lastAttemptedFile = candidate.name;
+          diagnostics.lastDownloadStatus = dl.status;
+          diagnostics.lastDownloadContentType = dl.contentType || "";
+          diagnostics.lastDownloadBytes = dl.byteSize || 0;
+          diagnostics.zipMagic = Boolean(dl.zipMagic);
+        } else {
+          diagnostics.fallbackFile = candidate.name;
+          diagnostics.fallbackDownloadStatus = dl.status;
+        }
+        if (dl.transientDownloadError || dl.status !== 200 || !dl.zipMagic || !dl.byteSize) {
+          diagnostics.lastError = "transient download error";
+          cooldowns[candidate.name] = now + cooldownMs;
+          continue;
+        }
+        delete cooldowns[candidate.name];
+        selected = dl;
+        selectedDataset = candidate;
+        this.log.debug(
+          `EU Data Act: ${vin} downloaded dataset in ${Date.now() - downloadStart}ms - ` +
+            `name=${candidate.name} bytes=${dl.byteSize || "?"} inner=${dl.fileName}`,
+        );
+        break;
+      }
+
+      if (!selected || !selectedDataset) {
+        if (attemptedFiles === 0) {
+          this.log.debug(`EU Data Act: ${vin} has no eligible dataset to download this cycle`);
+          return;
+        }
+        diagnostics.lastError = diagnostics.lastError || "transient download error";
+        await this._writeEuDataActDiagnostics(vin, diagnostics);
+        this.log.warn(
+          `EU Data Act: all dataset downloads failed vin=${this._maskVin(vin)} ` +
+            `attempted=${attemptedFiles} status=${lastDownload ? lastDownload.status : 0} ` +
+            `content-type=${(lastDownload && lastDownload.contentType) || "unknown"} ` +
+            `bytes=${(lastDownload && lastDownload.byteSize) || 0}`,
+        );
+        return;
+      }
+
+      const normalized = normalizeEuDataActDataset(selected.json);
+      const dataPoints = (selected.json.Data || []).length;
       const normalizedKeys = Object.keys(normalized).length;
       this.log.debug(
-        `EU Data Act: ${vin} downloaded new dataset in ${Date.now() - downloadStart}ms - ` +
-          `name=${newest.name} ` +
-          `createdOn=${newest.createdOn || "?"} ` +
-          `rawPoints=${dataPoints} ` +
-          `normalizedKeys=${normalizedKeys} ` +
-          `bytes=${dl.byteSize || "?"} ` +
-          `inner=${dl.fileName}`,
+        `EU Data Act: ${vin} parsed dataset name=${selectedDataset.name} ` +
+          `createdOn=${selectedDataset.createdOn || "?"} rawPoints=${dataPoints} ` +
+          `normalizedKeys=${normalizedKeys}`,
       );
-      // json2iob creates the root channel + every leaf state itself; we just
-      // tag the dataset metadata into the same object so it gets the same
-      // treatment (no manual extendObject/setState dance needed).
       const payload = {
         ...normalized,
-        _dataset_name: newest.name,
+        _dataset_name: selectedDataset.name,
       };
-      if (newest.createdOn) {
-        payload._dataset_created_on = newest.createdOn;
+      if (selectedDataset.createdOn) {
+        payload._dataset_created_on = selectedDataset.createdOn;
       }
       await this.json2iob.parse(vin + ".statuseudata", payload, {
         forceIndex: true,
@@ -7324,46 +7412,33 @@ class VwWeconnect extends utils.Adapter {
         descriptions: this.euDataActDescriptions,
         states: this.euDataActStates,
       });
-      this.euDataActLastDataset[vin] = newest.name;
-      // Reset the once-per-session no-content flag so a future stretch of
-      // empty datasets (e.g. car parked for days) will log the hint again.
+      const successTime = new Date().toISOString();
+      await this._writeEuDataActDiagnostics(vin, {
+        ...diagnostics,
+        lastError: "",
+        zipMagic: true,
+        lastSuccessFile: selectedDataset.name,
+        lastSuccess: successTime,
+      });
+      this.euDataActLastDataset[vin] = selectedDataset.name;
       this.euDataActNoContentLogged[vin] = false;
     } catch (err) {
       const msg = (err && err.message) || "";
-      // The lib already retries once on 401/403 internally; if it still fails
-      // here the session is genuinely dead and a manual re-login won't help.
-      //
-      // 404 on /list with body "No files available" is the expected cold-
-      // start state right after the user activates a continuous data request
-      // on the portal — the request itself is fine, the producer just hasn't
-      // emitted anything yet. Treat it as "no content yet", not as rotation.
-      //
-      // 404/400 on /metadata (or /list with a different body) usually means
-      // the request was rotated/cancelled on the portal — drop the cached
-      // Identifier so the next cycle re-fetches metadata.
       if (/No files available/i.test(msg)) {
         this.log.debug(`EU Data Act: ${vin} no datasets emitted yet (data request just activated?)`);
         return;
       }
-      // 5xx that survived the lib's single re-login retry — the portal is
-      // genuinely degraded (Adobe AEM outage / backend hiccup) or our 500+HTML
-      // heuristic was a false-positive (the body sometimes IS HTML for non-
-      // session reasons). Either way, don't hammer the endpoint every minute:
-      // pause this VIN for 15 min and try again on the next live cycle. The
-      // info level keeps the noise low; this is self-healing.
       const serverError = msg.match(/HTTP (5\d\d)/);
       if (serverError) {
         this.euDataActBackoffUntil[vin] = Date.now() + 15 * 60 * 1000;
         this.log.info(
-          `EU Data Act: ${vin} portal returned HTTP ${serverError[1]} (despite re-login retry); ` +
-            `pausing 15 min before the next cycle. This typically self-heals.`,
+          `EU Data Act: ${vin} portal returned HTTP ${serverError[1]}; ` +
+            `pausing 15 min before the next metadata/list cycle. This typically self-heals.`,
         );
         return;
       }
       if (/HTTP (?:404|400)/.test(msg)) {
-        this.log.warn(
-          `EU Data Act: ${vin} data-request seems rotated, will re-fetch metadata next cycle`,
-        );
+        this.log.warn(`EU Data Act: ${vin} data-request seems rotated, will re-fetch metadata next cycle`);
         if (this.euDataActIdentifiers) delete this.euDataActIdentifiers[vin];
       }
       this.log.error(`EU Data Act: status fetch failed for ${vin}: ${msg || err}`);
